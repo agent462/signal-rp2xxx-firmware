@@ -1,0 +1,26 @@
+; ws281x_parallel.pio - parallel WS281x output for 8 LED strips via PIO
+;
+; drives up to 8 GPIO pins simultaneously using bitplane data.
+; each 32-bit word from the FIFO contains 1 bit per strip for one bit position.
+;
+; timing (10 cycles/bit at 8 MHz PIO clock = 1.25 us/bit = 800 kHz):
+;   T1 (3 cycles, 375 ns): all pins HIGH  (start of bit)
+;   T2 (3 cycles, 375 ns): pins = data    (0-bits go LOW, 1-bits stay HIGH)
+;   T3 (3 cycles, 375 ns): all pins LOW   (end of bit)
+;   +1 cycle for out instruction           (pins still LOW from previous T3)
+;
+; resulting WS281x timing:
+;   T0H = 375 ns, T1H = 750 ns, T0L = 875 ns, T1L = 500 ns
+
+.program ws281x_parallel
+
+.define public T1 3
+.define public T2 3
+.define public T3 3
+
+.wrap_target
+    out x, 32               ; 1 cycle: pull 32 bits (1 bit per strip) into x
+    mov pins, !null [T1-1]  ; T1 cycles: all output pins HIGH
+    mov pins, x    [T2-1]   ; T2 cycles: set pins to data (0s go LOW)
+    mov pins, null [T3-1]   ; T3 cycles: all output pins LOW
+.wrap
