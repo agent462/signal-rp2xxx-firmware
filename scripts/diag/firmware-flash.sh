@@ -5,7 +5,7 @@
 # and reads serial output to verify the firmware is running.
 #
 # Usage:
-#   ./scripts/diag/scorpio-flash.sh [options]
+#   ./scripts/diag/firmware-flash.sh [options]
 #
 # Options:
 #   --board NAME         Board directory name (default: scorpio)
@@ -21,12 +21,12 @@
 #   pico2w_8ch           Raspberry Pi Pico 2 W (8-channel)
 #
 # Examples:
-#   ./scripts/diag/scorpio-flash.sh                    # flash SCORPIO (default)
-#   ./scripts/diag/scorpio-flash.sh -b                 # build + flash SCORPIO
-#   ./scripts/diag/scorpio-flash.sh --board pico2w_8ch -b  # build + flash Pico 2 W
-#   ./scripts/diag/scorpio-flash.sh -b -s 20           # build, flash, 20s serial
-#   ./scripts/diag/scorpio-flash.sh -S                 # just read serial output
-#   ./scripts/diag/scorpio-flash.sh -p pi@10.0.0.5     # custom host
+#   ./scripts/diag/firmware-flash.sh                    # flash SCORPIO (default)
+#   ./scripts/diag/firmware-flash.sh -b                 # build + flash SCORPIO
+#   ./scripts/diag/firmware-flash.sh --board pico2w_8ch -b  # build + flash Pico 2 W
+#   ./scripts/diag/firmware-flash.sh -b -s 20           # build, flash, 20s serial
+#   ./scripts/diag/firmware-flash.sh -S                 # just read serial output
+#   ./scripts/diag/firmware-flash.sh -p pi@10.0.0.5     # custom host
 #
 # Prerequisites:
 #   - Board must be in BOOTSEL mode (hold BOOTSEL while plugging USB)
