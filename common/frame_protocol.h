@@ -14,6 +14,7 @@
 // CRC covers bytes 2 through 8+N (LENGTH + FRAME_NUM + FLAGS + DATA).
 // sync word is excluded (known constant adds no validation value).
 
+#define SYNC_WORD         0xAA55
 #define FRAME_HEADER_SIZE 9  // sync(2) + length(2) + frame_num(4) + flags(1)
 #define FRAME_CRC_SIZE    2
 

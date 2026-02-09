@@ -20,8 +20,8 @@ frame_result_t frame_parse(const uint8_t *raw_data, uint32_t raw_len,
     if (raw_len < FRAME_HEADER_SIZE + FRAME_CRC_SIZE)
         return FRAME_ERR_TOO_SHORT;
 
-    // sync word
-    if (raw_data[0] != 0xAA || raw_data[1] != 0x55)
+    // sync word (SYNC_WORD = 0xAA55, big-endian)
+    if (raw_data[0] != (SYNC_WORD >> 8) || raw_data[1] != (SYNC_WORD & 0xFF))
         return FRAME_ERR_BAD_SYNC;
 
     // pixel data length (big-endian)

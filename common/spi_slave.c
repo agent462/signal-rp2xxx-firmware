@@ -85,13 +85,13 @@ void spi_slave_init(void) {
     gpio_set_dir(PIN_READY, GPIO_OUT);
     gpio_put(PIN_READY, 1);
 
-    // reset SPI1 peripheral to clean state.
+    // reset SPI peripheral to clean state.
     // bypass spi_init() which briefly enables SSE with SCR=255/CPSR=254,
     // violating the PL022 slave requirement: f_SSPCLK >= f_SCK / 12.
     // with f_SSPCLK too slow, DREQ misbehaves (stays asserted, DMA reads
     // empty FIFO producing 19200 garbage bytes).
-    reset_block(RESETS_RESET_SPI1_BITS);
-    unreset_block_wait(RESETS_RESET_SPI1_BITS);
+    reset_block(SPI_RESET_BITS);
+    unreset_block_wait(SPI_RESET_BITS);
 
     // after reset, SSE=0 (peripheral disabled). configure everything first.
     // CR0: DSS=7 (8-bit), SPO=1 SPH=1 (Mode 3), SCR=0

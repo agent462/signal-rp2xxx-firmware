@@ -81,7 +81,7 @@ int main(void) {
     status_led_update(0);
 
     sleep_ms(2000);
-    printf("=== signal scorpio phase 6 (dual-core SPI+WS281x) ===\n");
+    printf("=== signal %s (dual-core SPI+WS281x) ===\n", BOARD_NAME);
     printf("sys clock: %lu Hz\n", (unsigned long)clock_get_hz(clk_sys));
 
     spi_slave_init();

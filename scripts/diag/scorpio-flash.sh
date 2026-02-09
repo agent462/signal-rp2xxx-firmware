@@ -1,13 +1,14 @@
 #!/bin/bash
 #
-# SCORPIO Flash & Monitor
-# Builds RP2040 firmware locally, copies to a Pi, flashes via BOOTSEL,
+# Firmware Flash & Monitor
+# Builds firmware locally, copies to a Pi, flashes via BOOTSEL,
 # and reads serial output to verify the firmware is running.
 #
 # Usage:
 #   ./scripts/diag/scorpio-flash.sh [options]
 #
 # Options:
+#   --board NAME         Board directory name (default: scorpio)
 #   -p, --player HOST    Pi host (user@ip, default: signal@192.168.86.238)
 #   -b, --build          Build firmware before flashing
 #   -s, --serial SEC     Monitor serial output for SEC seconds (default: 8)
@@ -15,15 +16,20 @@
 #   -v, --verbose        Show detailed output
 #   -h, --help           Show this help
 #
+# Boards:
+#   scorpio              Adafruit Feather RP2040 SCORPIO (default)
+#   pico2w_8ch           Raspberry Pi Pico 2 W (8-channel)
+#
 # Examples:
-#   ./scripts/diag/scorpio-flash.sh                    # flash pre-built UF2
-#   ./scripts/diag/scorpio-flash.sh -b                 # build + flash
+#   ./scripts/diag/scorpio-flash.sh                    # flash SCORPIO (default)
+#   ./scripts/diag/scorpio-flash.sh -b                 # build + flash SCORPIO
+#   ./scripts/diag/scorpio-flash.sh --board pico2w_8ch -b  # build + flash Pico 2 W
 #   ./scripts/diag/scorpio-flash.sh -b -s 20           # build, flash, 20s serial
 #   ./scripts/diag/scorpio-flash.sh -S                 # just read serial output
 #   ./scripts/diag/scorpio-flash.sh -p pi@10.0.0.5     # custom host
 #
 # Prerequisites:
-#   - SCORPIO must be in BOOTSEL mode (hold BOOTSEL while plugging USB-C)
+#   - Board must be in BOOTSEL mode (hold BOOTSEL while plugging USB)
 #     OR already running firmware with USB serial (for --serial-only)
 #   - Pi must be reachable via SSH (key-based auth recommended)
 #   - For --build: ARM toolchain installed (brew install --cask gcc-arm-embedded)
@@ -33,16 +39,15 @@ set -e
 
 # Default configuration
 PLAYER_HOST="signal@192.168.86.238"
+BOARD="scorpio"
 BUILD=false
 SERIAL_SECS=8
 SERIAL_ONLY=false
 VERBOSE=false
 
-# Paths
+# Paths (FW_DIR and UF2_FILE set after argument parsing)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
-FW_DIR="$REPO_DIR/firmware/rp2040"
-UF2_FILE="$FW_DIR/build/signal_rp2040.uf2"
 MOUNT_PATH="/media"  # set dynamically after SSH_USER is known
 
 # Colors
@@ -57,6 +62,10 @@ BOLD='\033[1m'
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --board)
+            BOARD="$2"
+            shift 2
+            ;;
         -p|--player)
             PLAYER_HOST="$2"
             shift 2
@@ -78,7 +87,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            sed -n '3,32p' "$0"
+            sed -n '3,36p' "$0"
             exit 0
             ;;
         *)
@@ -87,6 +96,24 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# resolve board-specific paths
+FW_DIR="$REPO_DIR/boards/$BOARD"
+
+if [[ ! -d "$FW_DIR" ]]; then
+    echo -e "${RED}[error]${NC} Board directory not found: $FW_DIR"
+    echo "Available boards:"
+    ls "$REPO_DIR/boards/"
+    exit 1
+fi
+
+# map board name to UF2 binary name
+case $BOARD in
+    scorpio)      UF2_NAME="signal_rp2040.uf2" ;;
+    pico2w_8ch)   UF2_NAME="signal_pico2w.uf2" ;;
+    *)            UF2_NAME="signal_${BOARD}.uf2" ;;
+esac
+UF2_FILE="$FW_DIR/build/$UF2_NAME"
 
 # extract SSH user for mount path
 SSH_USER="${PLAYER_HOST%%@*}"
@@ -97,19 +124,19 @@ MOUNT_PATH="/media/$SSH_USER/RPI-RP2"
 
 # Helper functions
 log() {
-    echo -e "${CYAN}[scorpio]${NC} $1"
+    echo -e "${CYAN}[flash]${NC} $1"
 }
 
 log_success() {
-    echo -e "${GREEN}[scorpio]${NC} $1"
+    echo -e "${GREEN}[flash]${NC} $1"
 }
 
 log_warn() {
-    echo -e "${YELLOW}[scorpio]${NC} $1"
+    echo -e "${YELLOW}[flash]${NC} $1"
 }
 
 log_error() {
-    echo -e "${RED}[scorpio]${NC} $1"
+    echo -e "${RED}[flash]${NC} $1"
 }
 
 verbose() {
@@ -182,27 +209,27 @@ copy_firmware() {
     size=$(ls -lh "$UF2_FILE" | awk '{print $5}')
     verbose "UF2 size: $size"
 
-    scp -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$UF2_FILE" "$PLAYER_HOST:/tmp/signal_rp2040.uf2" 2>/dev/null
-    log_success "Copied to /tmp/signal_rp2040.uf2"
+    scp -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$UF2_FILE" "$PLAYER_HOST:/tmp/$UF2_NAME" 2>/dev/null
+    log_success "Copied to /tmp/$UF2_NAME"
 }
 
 # Phase 3: Flash via BOOTSEL
 flash_firmware() {
-    log "Checking for SCORPIO in BOOTSEL mode..."
+    log "Checking for board in BOOTSEL mode..."
 
-    # check for RP2 Boot USB device
+    # check for RP2 Boot USB device (vendor 2e8a, product 0003=RP2040, 000f=RP2350)
     local usb_info
     usb_info=$(ssh_cmd "$PLAYER_HOST" "lsusb 2>/dev/null | grep '2e8a'" || true)
 
-    if echo "$usb_info" | grep -q "0003"; then
+    if echo "$usb_info" | grep -qE "0003|000f"; then
         verbose "USB: RP2 Boot detected"
     elif echo "$usb_info" | grep -q "2e8a"; then
-        log_error "SCORPIO is running firmware, not in BOOTSEL mode"
-        log_error "Hold BOOTSEL while plugging USB-C, or hold BOOTSEL + press RESET"
+        log_error "Board is running firmware, not in BOOTSEL mode"
+        log_error "Hold BOOTSEL while plugging USB, or hold BOOTSEL + press RESET"
         exit 1
     else
-        log_error "No RP2040 device found on USB"
-        log_error "Check USB-C connection to SCORPIO"
+        log_error "No RP2040/RP2350 device found on USB"
+        log_error "Check USB connection to board"
         exit 1
     fi
 
@@ -249,9 +276,9 @@ flash_firmware() {
 
     # flash
     log "Flashing..."
-    ssh_cmd "$PLAYER_HOST" "sudo cp /tmp/signal_rp2040.uf2 '$MOUNT_PATH/'"
+    ssh_cmd "$PLAYER_HOST" "sudo cp '/tmp/$UF2_NAME' '$MOUNT_PATH/'"
 
-    log_success "Firmware written, SCORPIO is rebooting..."
+    log_success "Firmware written, board is rebooting..."
 
     # wait for reboot: BOOTSEL device disappears, ttyACM appears
     sleep 3
@@ -299,10 +326,11 @@ monitor_serial() {
 # Main
 main() {
     echo ""
-    echo -e "${BOLD}${CYAN}SCORPIO Flash & Monitor${NC}"
-    echo "======================="
+    echo -e "${BOLD}${CYAN}Firmware Flash & Monitor${NC}"
+    echo "========================"
     echo ""
-    echo "Host: $PLAYER_HOST"
+    echo "Board: $BOARD"
+    echo "Host:  $PLAYER_HOST"
 
     if $SERIAL_ONLY; then
         echo "Mode: serial monitor only"
