@@ -15,6 +15,7 @@
 #include "pico/stdlib.h"
 #include "pico/platform.h"
 #include "hardware/gpio.h"
+#include "hardware/sync.h"
 
 // WS2812 timing at 180 MHz (1 cycle = 5.56ns)
 // T0H: 350ns = 63 cycles, T0L: 800ns = 144 cycles
