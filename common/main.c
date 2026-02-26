@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <string.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/clocks.h"
@@ -18,14 +17,11 @@
 #define CORE1_READY   0xC0DE0001
 #define CORE1_DONE    0xC0DE0002
 
-// software timeout: blank LEDs after 2s with no valid frames
+// software timeout: log warning after 2s with no valid frames
 #define TIMEOUT_US 2000000
 
 // hardware watchdog: reboot if main loop hangs for 5s
 #define WATCHDOG_MS 5000
-
-// static blank pixel buffer for timeout blanking
-static uint8_t blank_pixels[MAX_FRAME_SIZE];
 
 // core1: bitplane transform + PIO WS281x output.
 // receives frame pointers from core0 via multicore FIFO, transforms pixel
@@ -96,9 +92,6 @@ int main(void) {
     }
     printf("core1 PIO initialized, waiting for frames...\n");
 
-    // zero the blank buffer once (BSS is zero-initialized, but be explicit)
-    memset(blank_pixels, 0, sizeof(blank_pixels));
-
     // enable hardware watchdog (5s safety net for firmware hangs)
     watchdog_enable(WATCHDOG_MS, true);
 
@@ -108,8 +101,6 @@ int main(void) {
     uint32_t drop_count = 0;
     uint64_t last_valid_frame_us = time_us_64();
     bool timed_out = false;
-    uint32_t last_num_ports = NUM_PORTS;
-    uint32_t last_pixels_per_port = MAX_PIXELS;
 
     while (true) {
         watchdog_update();
@@ -120,18 +111,7 @@ int main(void) {
                 timed_out = true;
                 status_led_set(STATUS_TIMEOUT);
                 status_led_update(frame_count);
-
-                // send blank frame to core1 via FIFO.
-                // use timeout push to handle potential core1 hang.
-                if (multicore_fifo_push_timeout_us(
-                        (uint32_t)blank_pixels, 100000)) {
-                    multicore_fifo_push_blocking(
-                        (last_num_ports << 16) | last_pixels_per_port);
-                    // wait for core1 to finish reading blank buffer
-                    multicore_fifo_pop_blocking();
-                }
-
-                printf("timeout: no frames for 2s, blanked LEDs\n");
+                printf("timeout: no frames for 2s\n");
             }
 
             tight_loop_contents();
@@ -167,10 +147,8 @@ int main(void) {
         gpio_put(PIN_LED, frame_count & 1);
 #endif
 
-        // track last valid frame time and dimensions for timeout blanking
+        // track last valid frame time for timeout detection
         last_valid_frame_us = time_us_64();
-        last_num_ports = info.num_ports;
-        last_pixels_per_port = info.pixels_per_port;
 
         if (timed_out) {
             timed_out = false;
