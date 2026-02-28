@@ -8,6 +8,7 @@ Firmware for RP2040/RP2350 microcontrollers that receive LED frame data daemon o
 |-------|-----|----------|---------------|--------|
 | SCORPIO | Adafruit Feather RP2040 SCORPIO | 8 | Built-in | `boards/scorpio/` |
 | Pico 2 W 8-ch | Raspberry Pi Pico 2 W (RP2350) | 8 | External SN74AHCT245N | `boards/pico2w_8ch/` |
+| Signal 8 | RP2350A on custom carrier (CM5) | 8 native + 4 differential + DMX | 74HCT245 + RS-485 | `boards/signal8/` |
 
 ## Directory Structure
 
@@ -18,7 +19,9 @@ common/                     shared source files (all boards)
   frame_protocol.h / .c     frame parsing, CRC-16 validation
   bitplane.h / .c           pixel-to-bitplane transform for PIO
   ws281x_parallel.pio       PIO program for parallel WS281x output
-  ws281x_parallel.h / .c    PIO init and DMA output
+  ws281x_parallel.h / .c    PIO init and DMA output (multi-instance)
+  dmx_output.pio             PIO UART TX for DMX512 (250kbaud 8N2)
+  dmx_output.h / .c          DMX init, BREAK/MAB, PIO byte output
   status_led.h / .c         onboard NeoPixel status (SCORPIO only)
   pico_sdk_import.cmake     Pico SDK locator
 boards/
@@ -28,6 +31,9 @@ boards/
   pico2w_8ch/               Pico 2 W + SN74AHCT245N (8 channels)
     config.h                pin assignments, SPI0 on GPIO16-19
     CMakeLists.txt          PICO_BOARD=pico2_w
+  signal8/                  Signal 8 controller (RP2350A + CM5 carrier)
+    config.h                pin assignments, 8 native + 4 diff + DMX
+    CMakeLists.txt          PICO_BOARD=pico2
 scripts/diag/
   firmware-flash.sh         build, flash via BOOTSEL, monitor serial
   spi_test.py               send test frames from Pi to verify SPI
@@ -65,6 +71,12 @@ cd boards/pico2w_8ch
 mkdir -p build && cd build
 cmake .. && make -j4
 # output: build/signal_pico2w.uf2
+
+# Signal 8 (8 native + 4 differential)
+cd boards/signal8
+mkdir -p build && cd build
+cmake .. && make -j4
+# output: build/signal_8.uf2
 ```
 
 ### Flash
@@ -164,14 +176,19 @@ A daemon sends frames over SPI at up to 7 MHz. The firmware is a SPI slave using
 Offset  Size  Field
 ------  ----  -----
 0       2     Sync word: 0xAA55
-2       2     Data length (big-endian, pixel data bytes only)
-4       4     Frame number (big-endian, monotonic counter)
-8       1     Flags: bits 3:0 = port count (1-8)
-9       N     Pixel data (port-sequential: all port0 pixels, then port1, ...)
-9+N     2     CRC-16-CCITT (big-endian, over bytes 2 through 8+N)
+2       4     Data length (big-endian uint32, total payload bytes)
+6       4     Frame number (big-endian uint32, monotonic counter)
+10      1     Flags: bits 3:0 = port count (1-15), bit 4 = DMX data follows
+11      N     Pixel data (port-sequential: all port0 pixels, then port1, ...)
+              If flags bit 4 set:
+11+P    D       DMX channel data (D bytes, 1-512)
+11+P+D  2       DMX data length (big-endian, D = 1-512)
+end-1   2     CRC-16-CCITT (big-endian, over bytes 2 through end-2)
 ```
 
-CRC-16-CCITT: polynomial 0x1021, init 0xFFFF. Covers LENGTH + FRAME_NUM + FLAGS + DATA.
+CRC-16-CCITT: polynomial 0x1021, init 0xFFFF. Covers LENGTH + FRAME_NUM + FLAGS + all payload DATA (pixel + DMX).
+
+When bit 4 of flags is clear (standard frame), the data length equals pixel data length and the format is backward-compatible with existing senders. When bit 4 is set, pixel data occupies the first `ports * pixels_per_port * 3` bytes, followed by the DMX channel data and a 2-byte DMX data length at the end of the payload.
 
 ### Flow Control
 
@@ -187,6 +204,13 @@ At 40fps: 0.27 MB/s (SPI at 7 MHz = 0.875 MB/s, plenty of headroom)
 
 8 ports x 800 pixels x 3 bytes = 19,200 bytes/frame
 At 40fps: 0.73 MB/s (17% headroom at 7 MHz)
+
+Signal 8 (12 ports):
+12 ports x 300 pixels x 3 bytes = 10,800 bytes/frame
+At 40fps: 0.41 MB/s (53% headroom at 7 MHz)
+
+12 ports x 800 pixels x 3 bytes = 28,800 bytes/frame
+At 28fps: 0.77 MB/s (SPI transfer time limits framerate)
 ```
 
 ### SPI Slave Notes
@@ -202,15 +226,53 @@ At 40fps: 0.73 MB/s (17% headroom at 7 MHz)
 ```
 Core 0                          Core 1
 ------                          ------
-SPI slave DMA reception    -->  Bitplane transform
+SPI slave DMA reception    -->  Bitplane transform (native + differential)
 Frame protocol parsing     -->  PIO DMA output to LEDs
-READY pin management            WS281x timing (800 kHz)
+READY pin management            DMX512 PIO UART output (Signal 8 only)
 Watchdog + timeout blanking
 ```
 
-Core 0 receives SPI frames via DMA, validates (sync, CRC, alignment), and passes pixel data to Core 1 via multicore FIFO. Core 1 transforms port-sequential pixel bytes into bitplane format and feeds the PIO state machine via DMA for parallel 8-strip output.
+Core 0 receives SPI frames via DMA, validates (sync, CRC, alignment), and passes a frame dispatch struct to Core 1 via multicore FIFO. Core 1 transforms port-sequential pixel bytes into bitplane format and feeds the PIO state machine(s) via DMA. On Signal 8, Core 1 also drives DMX512 output via a PIO-based UART.
 
 The firmware is color-order-agnostic. It outputs bytes in whatever order it receives them. Color order (RGB for WS2811, GRB for WS2812, etc.) is handled upstream.
+
+### Signal 8 PIO Allocation
+
+| PIO Block | SM | Function | GPIOs |
+|-----------|-----|----------|-------|
+| pio0 | SM0 | Native WS281x (8 ch) | GPIO8-15 |
+| pio1 | SM0 | Differential WS281x (4 ch) | GPIO16-19 |
+| pio2 | SM0 | DMX512 UART TX | GPIO21 |
+
+### CM5 to Signal 8
+
+```
+CM5 (SPI0 master)                Signal 8 RP2350A (SPI0 slave)
+================================  ================================
+SPI0_MOSI  ------------------>  GPIO0   SPI0_RX   (slave data in)
+SPI0_CE0   ------------------>  GPIO1   SPI0_CSn  (chip select)
+SPI0_SCLK  ------------------>  GPIO2   SPI0_SCK  (clock)
+SPI0_MISO  <------------------  GPIO3   SPI0_TX   (slave data out)
+GPIO (flow ctl)  <------------  GPIO4              (READY signal)
+                                GPIO5              (status LED)
+
+Native pixel outputs (via 74HCT245 level shifter):
+GPIO8  --> 74HCT245 --> Ch1 WS281x (Phoenix connector)
+GPIO9  --> 74HCT245 --> Ch2 WS281x
+...
+GPIO15 --> 74HCT245 --> Ch8 WS281x
+
+Differential pixel outputs (via RS-485 drivers):
+GPIO16 --> RS-485 TX --> RJ45 Ch1 (pins 1/2)
+GPIO17 --> RS-485 TX --> RJ45 Ch2 (pins 3/6)
+GPIO18 --> RS-485 TX --> RJ45 Ch3 (pins 4/5)
+GPIO19 --> RS-485 TX --> RJ45 Ch4 (pins 7/8)
+GPIO20 --> RS-485 DE (direction: shared for ch 1-4)
+
+DMX512 output (via RS-485 driver):
+GPIO21 --> RS-485 TX --> RJ45 DMX
+GPIO22 --> RS-485 DE (direction: DMX)
+```
 
 ## Adding a New Board
 
@@ -233,4 +295,15 @@ Required defines in `config.h`:
 | `PIN_READY` | READY signal GPIO |
 | `MAX_FRAME_SIZE` | `(NUM_PORTS * MAX_PIXELS * 3)` |
 
-Optional: `PIN_LED` (heartbeat toggle), `PIN_NEOPIXEL` (color status indicator).
+Optional:
+
+| Define | Purpose |
+|--------|---------|
+| `PIN_LED` | Heartbeat toggle LED |
+| `PIN_NEOPIXEL` | Color status indicator (NeoPixel) |
+| `NUM_DIFF_PORTS` | Differential output channel count (enables dual-PIO) |
+| `DIFF_PIN_BASE` | First GPIO for differential PIO outputs |
+| `PIN_DIFF_DIR` | RS-485 direction pin for differential channels |
+| `TOTAL_PORTS` | Total channels (native + differential), extends port validation |
+| `PIN_DMX_TX` | DMX512 PIO UART TX pin (enables DMX output) |
+| `PIN_DMX_DIR` | RS-485 direction pin for DMX |

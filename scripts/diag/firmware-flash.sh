@@ -19,6 +19,7 @@
 # Boards:
 #   scorpio              Adafruit Feather RP2040 SCORPIO (default)
 #   pico2w_8ch           Raspberry Pi Pico 2 W (8-channel)
+#   signal8              Signal 8 controller (RP2350A + CM5)
 #
 # Examples:
 #   ./scripts/diag/firmware-flash.sh                    # flash SCORPIO (default)
@@ -111,6 +112,7 @@ fi
 case $BOARD in
     scorpio)      UF2_NAME="signal_rp2040.uf2" ;;
     pico2w_8ch)   UF2_NAME="signal_pico2w.uf2" ;;
+    signal8)      UF2_NAME="signal_8.uf2" ;;
     *)            UF2_NAME="signal_${BOARD}.uf2" ;;
 esac
 UF2_FILE="$FW_DIR/build/$UF2_NAME"
