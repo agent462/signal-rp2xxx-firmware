@@ -9,16 +9,15 @@
 #include <string.h>
 
 // max protocol overhead for buffer sizing:
-// sync(2) + length(2) + frame_num(4) + flags(1) + crc(2) = 11
-// phase 3 receives raw bytes; protocol parsing is added in phase 4.
-#define PROTOCOL_OVERHEAD 11
+// sync(2) + length(4) + frame_num(4) + flags(1) + crc(2) = 13
+#define PROTOCOL_OVERHEAD 13
 #define RX_BUF_SIZE (MAX_FRAME_SIZE + PROTOCOL_OVERHEAD)
 
 // double buffers: DMA fills one while main loop processes the other.
 // NOTE: PL022 DREQ stays asserted after real data ends, causing DMA to
 // overrun the buffer with zero reads at bus speed. frame_len will be
 // RX_BUF_SIZE, not the actual frame size. use the protocol header's
-// length field (phase 4) to determine actual frame boundaries.
+// length field to determine actual frame boundaries.
 static uint8_t rx_buf[2][RX_BUF_SIZE];
 static volatile int active_buf = 0;
 static volatile uint32_t frame_len = 0;
