@@ -1,0 +1,27 @@
+; dmx_output.pio - PIO UART TX for DMX512 output (250kbaud, 8N2)
+;
+; GPIO21 on Signal 8 maps to UART1_RX (not TX), so hardware UART cannot
+; be used. This PIO program implements a standard UART TX instead.
+;
+; each byte: 1 start bit (LOW) + 8 data bits (LSB first) + 2 stop bits (HIGH)
+; = 11 bit times per byte = 44 µs at 250 kbaud
+;
+; clock divider: sys_clk / (250000 * 8) (e.g. 180 MHz / 2000000 = 90)
+; 8 PIO cycles = one bit time = 4 µs at 250 kbaud
+
+.program dmx_uart_tx
+
+.wrap_target
+    pull        block       ; wait for data in TX FIFO, load into OSR
+    set pins, 0 [7]        ; start bit LOW  (8 cycles = 4 µs)
+    out pins, 1 [7]        ; bit 0          (8 cycles = 4 µs)
+    out pins, 1 [7]        ; bit 1
+    out pins, 1 [7]        ; bit 2
+    out pins, 1 [7]        ; bit 3
+    out pins, 1 [7]        ; bit 4
+    out pins, 1 [7]        ; bit 5
+    out pins, 1 [7]        ; bit 6
+    out pins, 1 [7]        ; bit 7
+    set pins, 1 [7]        ; stop bit 1 HIGH (8 cycles = 4 µs)
+    set pins, 1 [6]        ; stop bit 2 HIGH (7 cycles + wrap to pull = 8 cycles)
+.wrap
