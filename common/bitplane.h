@@ -28,4 +28,17 @@
 void bitplane_transform(const uint8_t *pixel_data, uint32_t *bitplane,
                         uint num_ports, uint pixels_per_port);
 
+// transform a subset of ports from a larger frame into a separate bitplane.
+// extracts ports [port_offset .. port_offset+port_count) from the frame,
+// remapping them to bit positions 0..port_count-1 in the output.
+//
+// pixel_data: full frame pixel bytes (all ports * pixels_per_port * 3)
+// bitplane: output buffer, size >= BITPLANE_WORDS(pixels_per_port) uint32_t's
+// port_offset: first port index to extract
+// port_count: number of ports to extract (1-8)
+// pixels_per_port: number of pixels per strip
+void bitplane_transform_subset(const uint8_t *pixel_data, uint32_t *bitplane,
+                               uint port_offset, uint port_count,
+                               uint pixels_per_port);
+
 #endif
