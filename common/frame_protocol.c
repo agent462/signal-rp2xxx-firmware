@@ -46,6 +46,11 @@ frame_result_t frame_parse(const uint8_t *raw_data, uint32_t raw_len,
 #endif
         return FRAME_ERR_BAD_PORTS;
 
+#ifndef PIN_DMX_TX
+    if (flags & FRAME_FLAG_DMX_BIT)
+        return FRAME_ERR_BAD_PORTS;
+#endif
+
     uint32_t stride = ports * 3;
 
     // determine pixel data length (may be less than data_len if DMX present)

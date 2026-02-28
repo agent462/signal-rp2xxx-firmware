@@ -4,8 +4,10 @@
 // board identity
 #define BOARD_NAME "pico2w-8ch"
 
-// system clock: 180 MHz for SPI slave oversampling headroom
-#define SYS_CLOCK_KHZ 180000
+// system clock: 250 MHz (RP2350 stable max).
+// PL022 slave requires f_SSPCLK >= f_SCK/12; at 250 MHz with CPSR=2,
+// f_SSPCLK = 125 MHz -> max SPI slave clock = 10.42 MHz.
+#define SYS_CLOCK_KHZ 250000
 
 // WS281x PIO output (GPIO0-7 through SN74AHCT245N level shifter)
 #define NEO_PIN_BASE 0

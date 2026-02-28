@@ -199,18 +199,26 @@ The READY pin implements hardware flow control:
 ### Performance
 
 ```
+SPI slave max clock = f_SSPCLK / 12 (PL022 requirement)
+  RP2040  @ 180 MHz: CPSR=2 -> 90 MHz / 12 = 7.5 MHz (0.94 MB/s)
+  RP2350  @ 250 MHz: CPSR=2 -> 125 MHz / 12 = 10.42 MHz (1.30 MB/s)
+
+WS281x output time = pixels × 24 bits × 1.25µs
+  300 pixels: 9ms   (max ~111 fps)
+  800 pixels: 24ms  (max ~41 fps)
+
 8 ports x 300 pixels x 3 bytes = 7,200 bytes/frame
-At 40fps: 0.27 MB/s (SPI at 7 MHz = 0.875 MB/s, plenty of headroom)
+  SPI: 7.7ms @ 7.5 MHz  -> WS281x-limited @ 111 fps
 
 8 ports x 800 pixels x 3 bytes = 19,200 bytes/frame
-At 40fps: 0.73 MB/s (17% headroom at 7 MHz)
+  SPI: 20.5ms @ 7.5 MHz -> WS281x-limited @ 41 fps
 
-Signal 8 (12 ports):
+Signal 8 (12 ports, RP2350 @ 250 MHz):
 12 ports x 300 pixels x 3 bytes = 10,800 bytes/frame
-At 40fps: 0.41 MB/s (53% headroom at 7 MHz)
+  SPI: 8.3ms @ 10.42 MHz -> WS281x-limited @ 111 fps
 
 12 ports x 800 pixels x 3 bytes = 28,800 bytes/frame
-At 28fps: 0.77 MB/s (SPI transfer time limits framerate)
+  SPI: 22.1ms @ 10.42 MHz -> WS281x-limited @ 41 fps
 ```
 
 ### SPI Slave Notes

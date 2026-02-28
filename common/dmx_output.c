@@ -83,7 +83,7 @@ void dmx_output_send(dmx_ctx_t *ctx, const uint8_t *data, uint len) {
     while (!pio_sm_is_tx_fifo_empty(ctx->pio, ctx->sm)) {
         tight_loop_contents();
     }
-    sleep_us(44);
+    sleep_us(50);  // 44µs byte time + polling/startup margin
 
     // de-assert RS-485 direction: back to receive/idle
     gpio_put(ctx->pin_dir, 0);

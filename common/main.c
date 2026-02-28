@@ -7,6 +7,7 @@
 #include "hardware/pio.h"
 #include "hardware/timer.h"
 #include "hardware/dma.h"
+#include "hardware/sync.h"
 #include "hardware/watchdog.h"
 #include "config.h"
 #include "spi_slave.h"
@@ -84,6 +85,7 @@ static void core1_main(void) {
     while (true) {
         // block until core0 sends a frame dispatch struct pointer
         uint32_t dispatch_ptr = multicore_fifo_pop_blocking();
+        __mem_fence_acquire();  // ensure struct reads happen after pointer received
         const frame_dispatch_t *dispatch = (const frame_dispatch_t *)dispatch_ptr;
 
         uint32_t num_ports = dispatch->num_ports;
@@ -143,7 +145,7 @@ static void core1_main(void) {
 
             // wait for differential PIO to finish shifting out FIFO contents.
             // DMA done = all words written to FIFO, not shifted to pins.
-            // FIFO depth is 4 words * ~30µs/word = up to 120µs remaining.
+            // FIFO depth is 4 words * 1.25µs/word = up to 5µs remaining.
             while (!pio_sm_is_tx_fifo_empty(pio1, 0)) {
                 tight_loop_contents();
             }
@@ -293,6 +295,7 @@ int main(void) {
         dispatch.dmx_data = info.dmx_data;
         dispatch.dmx_len = info.dmx_len;
 #endif
+        __mem_fence_release();  // ensure all struct writes complete before pointer is visible
         multicore_fifo_push_blocking((uint32_t)&dispatch);
 
         // wait for core1 to finish reading from the SPI buffer.

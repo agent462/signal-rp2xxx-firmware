@@ -4,7 +4,9 @@
 // board identity
 #define BOARD_NAME "scorpio"
 
-// system clock: 180 MHz for SPI slave oversampling headroom
+// system clock: 180 MHz (RP2040 safe max).
+// PL022 slave requires f_SSPCLK >= f_SCK/12; at 180 MHz with CPSR=2,
+// f_SSPCLK = 90 MHz -> max SPI slave clock = 7.5 MHz.
 #define SYS_CLOCK_KHZ 180000
 
 // WS281x LED outputs (directly from RP2040 GPIO, active HIGH)
