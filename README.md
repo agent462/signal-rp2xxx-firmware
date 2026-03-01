@@ -279,6 +279,18 @@ SPI reception (core 0) and WS281x output (core 1) are pipelined, so the bottlene
 
 All target configurations (8 × 800 @ 40 fps on RP2040, 12 × 800 @ 40 fps on RP2350) are comfortably within limits — SPI transfer completes well before WS281x output finishes.
 
+The firmware has been pushed to near mathmateical theoretical limits of WS2811 for 800 Pixels (41.6 FPS) on 8 ports for long runs. The little loss will be from interupt handling, processing and wire speed.  
+
+| Metric | Value |
+|--------|-------|
+| Frames received | 1,096,000 |
+| Frame drops | 0 (0.0000%) |
+| CRC errors | 0 |
+| Sync errors | 0 |
+| Other errors | 0 |
+| Avg FPS (firmware) | 41.1 |
+| Total bytes | 21,057,448,000 |
+
 ### SPI Slave Notes
 
 - PL022 slave max SCK = clk_peri / 12 (15 MHz @ 180 MHz, 20.83 MHz @ 250 MHz)
