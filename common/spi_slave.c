@@ -86,9 +86,9 @@ void spi_slave_init(void) {
 
     // reset SPI peripheral to clean state.
     // bypass spi_init() which briefly enables SSE with SCR=255/CPSR=254,
-    // violating the PL022 slave requirement: f_SSPCLK >= f_SCK / 12.
-    // with f_SSPCLK too slow, DREQ misbehaves (stays asserted, DMA reads
-    // empty FIFO producing 19200 garbage bytes).
+    // creating a very slow bit clock. while CPSR only affects master-mode
+    // SCK generation (not slave sampling), the SDK's init sequence can
+    // cause DREQ misbehavior if SSE is enabled before we configure CR0.
     reset_block(SPI_RESET_BITS);
     unreset_block_wait(SPI_RESET_BITS);
 
@@ -99,7 +99,9 @@ void spi_slave_init(void) {
     spi_get_hw(SPI_PORT)->cr0 = (7u << SPI_SSPCR0_DSS_LSB)
                               | SPI_SSPCR0_SPO_BITS
                               | SPI_SSPCR0_SPH_BITS;
-    // CPSR=2: minimum prescaler -> f_SSPCLK = 180 MHz / (2 * 1) = 90 MHz
+    // CPSR=2: minimum valid prescaler (must be even, 2-254).
+    // only affects master-mode bit rate; in slave mode, clk_peri
+    // feeds the PL022 directly for the 12x oversampling constraint.
     spi_get_hw(SPI_PORT)->cpsr = 2;
     // CR1: slave mode (MS=1), SSE still disabled
     spi_get_hw(SPI_PORT)->cr1 = SPI_SSPCR1_MS_BITS;
@@ -124,12 +126,17 @@ void spi_slave_init(void) {
 
     // debug: test DMA DREQ pacing before enabling interrupts.
     // start DMA, wait 100ms with no SPI activity, check if DMA waited.
+    // NOTE: if the SPI master is not connected or its GPIOs are floating,
+    // noise on SCK can clock garbage into the PL022 slave, causing a few
+    // bytes to transfer even though DREQ pacing is correct.
     start_dma_receive();
     sleep_ms(100);
     uint32_t test_rem = dma_channel_hw_addr(dma_chan)->transfer_count;
+    bool dreq_ok = (test_rem == RX_BUF_SIZE);
+    bool dreq_noise = (!dreq_ok && test_rem > 0);
     printf("DMA DREQ test: remaining=%lu/%d after 100ms idle (%s)\n",
            (unsigned long)test_rem, RX_BUF_SIZE,
-           test_rem == RX_BUF_SIZE ? "DREQ working" : "DREQ BROKEN");
+           dreq_ok ? "ok" : dreq_noise ? "noise on SPI lines" : "BROKEN");
     // abort test DMA before restarting properly
     dma_channel_abort(dma_chan);
 
@@ -142,12 +149,15 @@ void spi_slave_init(void) {
     // start DMA receive for real
     start_dma_receive();
 
-    // debug: print DMA config for verification
+    // debug: print DMA config for verification.
+    // TREQ_SEL bit position differs between RP2040 (bit 15) and RP2350 (bit 17);
+    // use SDK define for portable extraction.
     uint dreq = spi_get_dreq(SPI_PORT, false);
     uint32_t ctrl = dma_channel_hw_addr(dma_chan)->ctrl_trig;
-    uint treq_sel = (ctrl >> 15) & 0x3f;
-    printf("DMA ch=%d dreq=%d ctrl=0x%08lx treq_sel=%d\n",
-           dma_chan, dreq, (unsigned long)ctrl, treq_sel);
+    uint treq_sel = (ctrl >> DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) & 0x3f;
+    printf("DMA ch=%d dreq=%d ctrl=0x%08lx treq_sel=%d (%s)\n",
+           dma_chan, dreq, (unsigned long)ctrl, treq_sel,
+           treq_sel == dreq ? "match" : "MISMATCH");
 }
 
 static void start_dma_receive(void) {

@@ -5,7 +5,7 @@
 # and reads serial output to verify the firmware is running.
 #
 # Usage:
-#   ./scripts/diag/firmware-flash.sh [options]
+#   ./scripts/firmware-flash.sh [options]
 #
 # Options:
 #   --board NAME         Board directory name (default: scorpio)
@@ -13,6 +13,7 @@
 #   -b, --build          Build firmware before flashing
 #   -s, --serial SEC     Monitor serial output for SEC seconds (default: 8)
 #   -S, --serial-only    Skip flash, just monitor serial output
+#   -R, --reboot         Reboot into BOOTSEL via 1200-baud USB trick
 #   -v, --verbose        Show detailed output
 #   -h, --help           Show this help
 #
@@ -22,16 +23,17 @@
 #   signal8              Signal 8 controller (RP2350A + CM5)
 #
 # Examples:
-#   ./scripts/diag/firmware-flash.sh                    # flash SCORPIO (default)
-#   ./scripts/diag/firmware-flash.sh -b                 # build + flash SCORPIO
-#   ./scripts/diag/firmware-flash.sh --board pico2w_8ch -b  # build + flash Pico 2 W
-#   ./scripts/diag/firmware-flash.sh -b -s 20           # build, flash, 20s serial
-#   ./scripts/diag/firmware-flash.sh -S                 # just read serial output
-#   ./scripts/diag/firmware-flash.sh -p pi@10.0.0.5     # custom host
+#   ./scripts/firmware-flash.sh                    # flash SCORPIO (default)
+#   ./scripts/firmware-flash.sh -b                 # build + flash SCORPIO
+#   ./scripts/firmware-flash.sh --board pico2w_8ch -b  # build + flash Pico 2 W
+#   ./scripts/firmware-flash.sh -b -s 20           # build, flash, 20s serial
+#   ./scripts/firmware-flash.sh -S                 # just read serial output
+#   ./scripts/firmware-flash.sh -p pi@10.0.0.5     # custom host
+#   ./scripts/firmware-flash.sh -R -b              # 1200-baud reboot + build + flash
 #
 # Prerequisites:
-#   - Board must be in BOOTSEL mode (hold BOOTSEL while plugging USB)
-#     OR already running firmware with USB serial (for --serial-only)
+#   - Board must be in BOOTSEL mode (hold BOOTSEL while plugging USB,
+#     or use -R to reboot via 1200-baud trick)
 #   - Pi must be reachable via SSH (key-based auth recommended)
 #   - For --build: ARM toolchain installed (brew install --cask gcc-arm-embedded)
 #
@@ -44,11 +46,12 @@ BOARD="scorpio"
 BUILD=false
 SERIAL_SECS=8
 SERIAL_ONLY=false
+REBOOT=false
 VERBOSE=false
 
 # Paths (FW_DIR and UF2_FILE set after argument parsing)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
 MOUNT_PATH="/media"  # set dynamically after SSH_USER is known
 
 # Colors
@@ -81,6 +84,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -S|--serial-only)
             SERIAL_ONLY=true
+            shift
+            ;;
+        -R|--reboot)
+            REBOOT=true
             shift
             ;;
         -v|--verbose)
@@ -151,6 +158,31 @@ ssh_cmd() {
     local host=$1
     shift
     ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$host" "$@" 2>/dev/null
+}
+
+# Phase 0: Reboot into BOOTSEL via 1200-baud trick (optional)
+# The Pico SDK's USB CDC implementation reboots into BOOTSEL when the
+# host opens the serial port at 1200 baud and closes it. This avoids
+# needing physical access to the BOOTSEL button.
+reboot_to_bootsel() {
+    if ! $REBOOT; then
+        return
+    fi
+
+    log "Rebooting into BOOTSEL via 1200-baud trick..."
+
+    # check if ttyACM device exists (board must be running firmware)
+    local tty_dev
+    tty_dev=$(ssh_cmd "$PLAYER_HOST" "ls /dev/ttyACM0 2>/dev/null" || true)
+    if [[ -z "$tty_dev" ]]; then
+        log_warn "No /dev/ttyACM0 found -- board may already be in BOOTSEL"
+        return
+    fi
+
+    # open at 1200 baud to trigger Pico SDK's BOOTSEL reboot
+    ssh_cmd "$PLAYER_HOST" "stty -F /dev/ttyACM0 1200"
+    log_success "1200-baud reset sent, waiting for BOOTSEL..."
+    sleep 3
 }
 
 # Phase 1: Build (optional)
@@ -227,7 +259,7 @@ flash_firmware() {
         verbose "USB: RP2 Boot detected"
     elif echo "$usb_info" | grep -q "2e8a"; then
         log_error "Board is running firmware, not in BOOTSEL mode"
-        log_error "Hold BOOTSEL while plugging USB, or hold BOOTSEL + press RESET"
+        log_error "Use -R to reboot via 1200-baud trick, or hold BOOTSEL + press RESET"
         exit 1
     else
         log_error "No RP2040/RP2350 device found on USB"
@@ -339,14 +371,14 @@ main() {
         echo ""
         monitor_serial
     else
-        if $BUILD; then
-            echo "Mode: build + flash + serial"
-        else
-            echo "Mode: flash + serial"
-        fi
+        local mode="flash + serial"
+        $BUILD && mode="build + $mode"
+        $REBOOT && mode="reboot + $mode"
+        echo "Mode: $mode"
         echo ""
 
         build_firmware
+        reboot_to_bootsel
         copy_firmware
         flash_firmware
         monitor_serial

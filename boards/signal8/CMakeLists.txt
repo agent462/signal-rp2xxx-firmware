@@ -29,6 +29,10 @@ target_include_directories(signal_8 PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
 )
 
+target_compile_definitions(signal_8 PRIVATE
+    PICO_CLOCK_ADJUST_PERI_CLOCK_WITH_SYS_CLOCK=1
+)
+
 pico_generate_pio_header(signal_8
     ${CMAKE_CURRENT_SOURCE_DIR}/../../common/ws281x_parallel.pio
 )

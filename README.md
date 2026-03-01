@@ -34,9 +34,14 @@ boards/
   signal8/                  Signal 8 controller (RP2350A + CM5 carrier)
     config.h                pin assignments, 8 native + 4 diff + DMX
     CMakeLists.txt          PICO_BOARD=pico2
-scripts/diag/
+scripts/
   firmware-flash.sh         build, flash via BOOTSEL, monitor serial
   spi_test.py               send test frames from Pi to verify SPI
+  spi_stress.py             long-duration SPI stress test sender (Python, legacy)
+  spi_stress/               Go rewrite of stress test sender (faster timing)
+    main.go                 single-file Go implementation
+    go.mod                  Go module (stdlib only, no deps)
+  spi_stress_report.py      post-test log analyzer
 ```
 
 Each board has only a `config.h` (pin assignments) and `CMakeLists.txt`. All firmware logic is shared.
@@ -81,7 +86,7 @@ cmake .. && make -j4
 
 ### Flash
 
-Hold BOOTSEL while plugging USB. Copy the UF2 to the mounted drive:
+Hold BOOTSEL while plugging USB, or use the 1200-baud trick to reboot remotely (see below). Copy the UF2 to the mounted drive:
 
 ```bash
 # macOS (board appears as RPI-RP2 volume)
@@ -95,9 +100,22 @@ sudo cp build/signal_pico2w.uf2 /media/$USER/RPI-RP2/
 Or use the flash script from a Mac to build, SCP, and flash on a remote Pi:
 
 ```bash
-./scripts/diag/firmware-flash.sh --board scorpio -b       # SCORPIO (default)
-./scripts/diag/firmware-flash.sh --board pico2w_8ch -b    # Pico 2 W
-./scripts/diag/firmware-flash.sh -S                       # serial monitor only
+./scripts/firmware-flash.sh --board scorpio -b       # SCORPIO (default)
+./scripts/firmware-flash.sh --board pico2w_8ch -b    # Pico 2 W
+./scripts/firmware-flash.sh -R -b                    # 1200-baud reboot + build + flash
+./scripts/firmware-flash.sh -S                       # serial monitor only
+```
+
+#### 1200-Baud BOOTSEL Trick
+
+The Pico SDK's USB CDC implementation reboots into BOOTSEL mode when the host opens the serial port at 1200 baud. This allows remote flashing without physical access to the BOOTSEL button:
+
+```bash
+# manual (on the Pi)
+stty -F /dev/ttyACM0 1200    # board reboots into BOOTSEL
+
+# via flash script (from Mac)
+./scripts/firmware-flash.sh --board pico2w_8ch -R -b
 ```
 
 ### Monitor Serial
@@ -166,84 +184,6 @@ Decoupling: 100nF ceramic + 10uF electrolytic on '245 VCC, close to pin 20.
 B-side pins are in REVERSE order (B1=pin 18, B8=pin 11).
 ```
 
-## SPI Protocol
-
-A daemon sends frames over SPI at up to 7 MHz. The firmware is a SPI slave using PL022 Mode 3 (CPOL=1, CPHA=1).
-
-### Frame Format
-
-```
-Offset  Size  Field
-------  ----  -----
-0       2     Sync word: 0xAA55
-2       4     Data length (big-endian uint32, total payload bytes)
-6       4     Frame number (big-endian uint32, monotonic counter)
-10      1     Flags: bits 3:0 = port count (1-15), bit 4 = DMX data follows
-11      N     Pixel data (port-sequential: all port0 pixels, then port1, ...)
-              If flags bit 4 set:
-11+P    D       DMX channel data (D bytes, 1-512)
-11+P+D  2       DMX data length (big-endian, D = 1-512)
-end-1   2     CRC-16-CCITT (big-endian, over bytes 2 through end-2)
-```
-
-CRC-16-CCITT: polynomial 0x1021, init 0xFFFF. Covers LENGTH + FRAME_NUM + FLAGS + all payload DATA (pixel + DMX).
-
-When bit 4 of flags is clear (standard frame), the data length equals pixel data length and the format is backward-compatible with existing senders. When bit 4 is set, pixel data occupies the first `ports * pixels_per_port * 3` bytes, followed by the DMX channel data and a 2-byte DMX data length at the end of the payload.
-
-### Flow Control
-
-The READY pin implements hardware flow control:
-- **HIGH**: firmware is ready to receive a frame
-- **LOW**: firmware is processing (Pi must wait before sending)
-
-### Performance
-
-```
-SPI slave max clock = f_SSPCLK / 12 (PL022 requirement)
-  RP2040  @ 180 MHz: CPSR=2 -> 90 MHz / 12 = 7.5 MHz (0.94 MB/s)
-  RP2350  @ 250 MHz: CPSR=2 -> 125 MHz / 12 = 10.42 MHz (1.30 MB/s)
-
-WS281x output time = pixels × 24 bits × 1.25µs
-  300 pixels: 9ms   (max ~111 fps)
-  800 pixels: 24ms  (max ~41 fps)
-
-8 ports x 300 pixels x 3 bytes = 7,200 bytes/frame
-  SPI: 7.7ms @ 7.5 MHz  -> WS281x-limited @ 111 fps
-
-8 ports x 800 pixels x 3 bytes = 19,200 bytes/frame
-  SPI: 20.5ms @ 7.5 MHz -> WS281x-limited @ 41 fps
-
-Signal 8 (12 ports, RP2350 @ 250 MHz):
-12 ports x 300 pixels x 3 bytes = 10,800 bytes/frame
-  SPI: 8.3ms @ 10.42 MHz -> WS281x-limited @ 111 fps
-
-12 ports x 800 pixels x 3 bytes = 28,800 bytes/frame
-  SPI: 22.1ms @ 10.42 MHz -> WS281x-limited @ 41 fps
-```
-
-### SPI Slave Notes
-
-- PL022 slave max SCK = 7.5 MHz (f_SSPCLK = 180 MHz / CPSR=2 = 90 MHz, /12 = 7.5 MHz)
-- Mode 3 (CPHA=1) required for multi-byte transfers with CS held low
-- First frame after boot is bit-shifted; daemon sends a 4-byte dummy to align
-- SCK needs pull-up (CPOL=1 idles HIGH)
-- PL022 DREQ overrun: firmware disables RXDMAE on CS rising edge to prevent DMA racing through buffer with zero reads
-
-## Architecture
-
-```
-Core 0                          Core 1
-------                          ------
-SPI slave DMA reception    -->  Bitplane transform (native + differential)
-Frame protocol parsing     -->  PIO DMA output to LEDs
-READY pin management            DMX512 PIO UART output (Signal 8 only)
-Watchdog + timeout blanking
-```
-
-Core 0 receives SPI frames via DMA, validates (sync, CRC, alignment), and passes a frame dispatch struct to Core 1 via multicore FIFO. Core 1 transforms port-sequential pixel bytes into bitplane format and feeds the PIO state machine(s) via DMA. On Signal 8, Core 1 also drives DMX512 output via a PIO-based UART.
-
-The firmware is color-order-agnostic. It outputs bytes in whatever order it receives them. Color order (RGB for WS2811, GRB for WS2812, etc.) is handled upstream.
-
 ### Signal 8 PIO Allocation
 
 | PIO Block | SM | Function | GPIOs |
@@ -282,18 +222,98 @@ GPIO21 --> RS-485 TX --> RJ45 DMX
 GPIO22 --> RS-485 DE (direction: DMX)
 ```
 
+## SPI Protocol
+
+A daemon sends frames over SPI at up to 15 MHz (RP2040) / 20 MHz (RP2350). The firmware is a SPI slave using PL022 Mode 3 (CPOL=1, CPHA=1).
+
+### Frame Format
+
+```
+Offset  Size  Field
+------  ----  -----
+0       2     Sync word: 0xAA55
+2       4     Data length (big-endian uint32, total payload bytes)
+6       4     Frame number (big-endian uint32, monotonic counter)
+10      1     Flags: bits 3:0 = port count (1-15), bit 4 = DMX data follows
+11      N     Pixel data (port-sequential: all port0 pixels, then port1, ...)
+              If flags bit 4 set:
+11+P    D       DMX channel data (D bytes, 1-512)
+11+P+D  2       DMX data length (big-endian, D = 1-512)
+end-1   2     CRC-16-CCITT (big-endian, over bytes 2 through end-2)
+```
+
+CRC-16-CCITT: polynomial 0x1021, init 0xFFFF. Covers LENGTH + FRAME_NUM + FLAGS + all payload DATA (pixel + DMX).
+
+When bit 4 of flags is clear (standard frame), the data length equals pixel data length and the format is backward-compatible with existing senders. When bit 4 is set, pixel data occupies the first `ports * pixels_per_port * 3` bytes, followed by the DMX channel data and a 2-byte DMX data length at the end of the payload.
+
+### Flow Control
+
+The READY pin implements hardware flow control:
+- **HIGH**: firmware is ready to receive a frame
+- **LOW**: firmware is processing (Pi must wait before sending)
+
+### Performance
+
+#### SPI Clock Limits
+
+PL022 slave requires `clk_peri >= 12 × f_SCK`. With `PICO_CLOCK_ADJUST_PERI_CLOCK_WITH_SYS_CLOCK=1`, clk_peri tracks sys_clk:
+
+| Board | MCU | sys_clk | Max SPI SCK | Throughput |
+|-------|-----|---------|-------------|------------|
+| SCORPIO | RP2040 | 180 MHz | 15 MHz | 1.88 MB/s |
+| Pico 2 W 8-ch | RP2350 | 250 MHz | 20 MHz | 2.60 MB/s |
+| Signal 8 | RP2350 | 250 MHz | 20 MHz | 2.60 MB/s |
+
+#### Frame Timing
+
+SPI reception (core 0) and WS281x output (core 1) are pipelined, so the bottleneck is whichever takes longer. WS281x output time = pixels × 24 bits × 1.25 µs (9 ms @ 300 px, 24 ms @ 800 px).
+
+| Board | Ports × Pixels | Frame Size | SPI Time | WS281x Time | Bottleneck | Max FPS |
+|-------|---------------|------------|----------|-------------|------------|---------|
+| SCORPIO | 8 × 300 | 7,200 B | 3.8 ms @ 15 MHz | 9 ms | WS281x | **111** |
+| SCORPIO | 8 × 800 | 19,200 B | 10.2 ms @ 15 MHz | 24 ms | WS281x | **41** |
+| Pico 2 W | 8 × 300 | 7,200 B | 2.9 ms @ 20 MHz | 9 ms | WS281x | **111** |
+| Pico 2 W | 8 × 800 | 19,200 B | 7.7 ms @ 20 MHz | 24 ms | WS281x | **41** |
+| Signal 8 | 12 × 300 | 10,800 B | 4.3 ms @ 20 MHz | 9 ms | WS281x | **111** |
+| Signal 8 | 12 × 800 | 28,800 B | 11.5 ms @ 20 MHz | 24 ms | WS281x | **41** |
+
+All target configurations (8 × 800 @ 40 fps on RP2040, 12 × 800 @ 40 fps on RP2350) are comfortably within limits — SPI transfer completes well before WS281x output finishes.
+
+### SPI Slave Notes
+
+- PL022 slave max SCK = clk_peri / 12 (15 MHz @ 180 MHz, 20.83 MHz @ 250 MHz)
+- Mode 3 (CPHA=1) required for multi-byte transfers with CS held low
+- First frame after boot is bit-shifted; daemon sends a 4-byte dummy to align
+- SCK needs pull-up (CPOL=1 idles HIGH)
+- PL022 DREQ overrun: firmware disables RXDMAE on CS rising edge to prevent DMA racing through buffer with zero reads
+
+## Architecture
+
+```
+Core 0                          Core 1
+------                          ------
+SPI slave DMA reception    -->  Bitplane transform (native + differential)
+Frame protocol parsing     -->  PIO DMA output to LEDs
+READY pin management            DMX512 PIO UART output (Signal 8 only)
+Watchdog + timeout blanking
+```
+
+Core 0 receives SPI frames via DMA, validates (sync, CRC, alignment), and passes a frame dispatch struct to Core 1 via multicore FIFO. Core 1 transforms port-sequential pixel bytes into bitplane format and feeds the PIO state machine(s) via DMA. On Signal 8, Core 1 also drives DMX512 output via a PIO-based UART.
+
+The firmware is color-order-agnostic. It outputs bytes in whatever order it receives them. Color order (RGB for WS2811, GRB for WS2812, etc.) is handled upstream.
+
 ## Adding a New Board
 
 1. Create `boards/<name>/config.h` with pin assignments (see existing configs)
 2. Create `boards/<name>/CMakeLists.txt` (copy from an existing board, change project name and `PICO_BOARD`)
-3. Add a case to `scripts/diag/firmware-flash.sh` for the UF2 filename mapping
+3. Add a case to `scripts/firmware-flash.sh` for the UF2 filename mapping
 
 Required defines in `config.h`:
 
 | Define | Purpose |
 |--------|---------|
 | `BOARD_NAME` | String for boot message |
-| `SYS_CLOCK_KHZ` | System clock (180000 for 7.5 MHz SPI slave) |
+| `SYS_CLOCK_KHZ` | System clock (180000 RP2040, 250000 RP2350) |
 | `NEO_PIN_BASE` | First GPIO for PIO LED outputs |
 | `NUM_PORTS` | Number of parallel LED outputs |
 | `MAX_PIXELS` | Max pixels per port |
@@ -315,3 +335,43 @@ Optional:
 | `TOTAL_PORTS` | Total channels (native + differential), extends port validation |
 | `PIN_DMX_TX` | DMX512 PIO UART TX pin (enables DMX output) |
 | `PIN_DMX_DIR` | RS-485 direction pin for DMX |
+
+## Stress Testing
+
+The Go stress test sender (`scripts/spi_stress/`) sends frames at a target FPS and logs all events for post-test analysis. It replaces the Python `spi_stress.py` for tighter frame timing.
+
+### Build
+
+```bash
+cd scripts/spi_stress
+GOOS=linux GOARCH=arm64 go build -o spi_stress
+```
+
+### Deploy and Run
+
+```bash
+scp scripts/spi_stress/spi_stress signal@<host>:~/
+ssh signal@<host> './spi_stress -n 800 -p 8 -f 40 --duration 300'
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-s` | 15000000 | SPI clock Hz |
+| `-n` | 300 | pixels per port |
+| `-p` | 8 | number of ports |
+| `-f` | 40 | target FPS |
+| `--duration` | 28800 | test duration (seconds) |
+| `--serial` | /dev/ttyACM0 | firmware serial port |
+| `--log-dir` | ./stress_logs | output directory |
+| `--speed-sweep` | false | ramp speed every 30 min (5, 7, 10, 12, 15 MHz) |
+| `--ready-pin` | 16 | BCM GPIO pin for READY |
+
+### Analyze Results
+
+```bash
+python3 scripts/spi_stress_report.py stress_logs/<run-dir>
+```
+
+The report parses `pi_sender.jsonl` and `firmware_serial.log` to show frame counts, error rates, and a PASS/ISSUES verdict.

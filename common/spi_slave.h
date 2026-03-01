@@ -5,8 +5,8 @@
 #include <stdbool.h>
 
 // initialize SPI peripheral as slave with DMA reception and READY pin.
-// must be called after set_sys_clock_khz() -- PL022 slave needs 12x
-// oversampling: f_SSPCLK = 180/(CPSR=2) = 90 MHz, max SCK = 7.5 MHz.
+// must be called after set_sys_clock_khz() -- PL022 slave needs
+// clk_peri >= 12 * f_SCK for reliable sampling.
 // uses SPI Mode 3 (CPOL=1, CPHA=1) -- Mode 0 limits PL022 slave to 1 byte.
 // SPI port and reset bits are configured via SPI_PORT and SPI_RESET_BITS in config.h.
 void spi_slave_init(void);

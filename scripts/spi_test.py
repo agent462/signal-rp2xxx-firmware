@@ -11,12 +11,13 @@ Requirements: pip install spidev RPi.GPIO
 """
 import spidev
 import RPi.GPIO as GPIO
+import binascii
 import time
 import sys
 import argparse
 
 READY_PIN = 16          # BCM GPIO16 on Pi (wired to GPIO10 on SCORPIO)
-SPI_SPEED = 1_000_000   # 1 MHz (diagnostic: PL022 slave max = f_SSPCLK/12 = 7.5 MHz)
+SPI_SPEED = 1_000_000   # 1 MHz (diagnostic: PL022 slave max = clk_peri/12 = 15+ MHz)
 SPI_MODE = 0b11         # CPOL=1, CPHA=1 (Mode 3)
 
 COLORS = [
@@ -30,16 +31,8 @@ COLORS = [
 
 
 def crc16_ccitt(data):
-    """CRC-16-CCITT: polynomial 0x1021, init 0xFFFF."""
-    crc = 0xFFFF
-    for byte in data:
-        crc ^= byte << 8
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
-    return crc
+    """CRC-16-CCITT: polynomial 0x1021, init 0xFFFF. Uses C implementation."""
+    return binascii.crc_hqx(bytes(data), 0xFFFF)
 
 
 def wait_ready(timeout_s=5.0):
@@ -55,15 +48,17 @@ def wait_ready(timeout_s=5.0):
 def build_frame(frame_num, num_ports, pixel_data):
     """build a framed packet with CRC-16.
 
-    protocol: sync(2) + len(2) + frame_num(4) + flags(1) + data(N) + crc(2)
+    protocol: sync(2) + len(4) + frame_num(4) + flags(1) + data(N) + crc(2)
     flags bits 3:0 = port count
     CRC covers bytes after sync: len + frame_num + flags + data
     """
     data_len = len(pixel_data)
     header = [
         0xAA, 0x55,                         # sync word
-        (data_len >> 8) & 0xFF,             # length high byte
-        data_len & 0xFF,                    # length low byte
+        (data_len >> 24) & 0xFF,            # length (big-endian uint32)
+        (data_len >> 16) & 0xFF,
+        (data_len >> 8) & 0xFF,
+        data_len & 0xFF,
         (frame_num >> 24) & 0xFF,           # frame number (big-endian)
         (frame_num >> 16) & 0xFF,
         (frame_num >> 8) & 0xFF,
@@ -98,6 +93,27 @@ def main():
     spi.max_speed_hz = args.speed
     spi.mode = SPI_MODE
 
+    # ensure spidev kernel buffer fits a full frame in one CS cycle
+    pkt_size = args.ports * args.pixels * 3 + 13
+    bufsiz_path = "/sys/module/spidev/parameters/bufsiz"
+    try:
+        with open(bufsiz_path) as f:
+            bufsiz = int(f.read().strip())
+        if bufsiz < pkt_size:
+            needed = max(pkt_size, 65536)
+            try:
+                with open(bufsiz_path, "w") as f:
+                    f.write(str(needed))
+                print(f"  spidev bufsiz: {bufsiz} -> {needed}")
+            except PermissionError:
+                print(f"ERROR: spidev bufsiz={bufsiz} < frame size {pkt_size}")
+                print(f"  run: sudo sh -c 'echo {needed} > {bufsiz_path}'")
+                spi.close()
+                GPIO.cleanup()
+                sys.exit(1)
+    except FileNotFoundError:
+        pass
+
     try:
         print(f"SPI: {args.speed / 1e6:.1f} MHz, mode {SPI_MODE}")
         print(f"config: {args.ports} port(s), {args.pixels} pixels/port")
@@ -109,7 +125,7 @@ def main():
 
         # send a dummy frame to align the PL022 shift register.
         # CPHA=1 causes a 1-bit shift on the very first transfer after boot.
-        spi.xfer2([0x00] * 4)
+        spi.writebytes2([0x00] * 4)
         print("  sync: 4-byte alignment frame sent")
         time.sleep(0.5)
 
@@ -123,7 +139,7 @@ def main():
             pixel_data = port_pixels * args.ports
 
             packet = build_frame(i + 1, args.ports, pixel_data)
-            spi.xfer2(packet)
+            spi.writebytes2(packet)
 
             data_bytes = len(pixel_data)
             print(f"  frame {i + 1}: {name:6s} ({rgb[0]:3d},{rgb[1]:3d},{rgb[2]:3d}) "

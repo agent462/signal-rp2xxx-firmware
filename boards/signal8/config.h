@@ -5,8 +5,8 @@
 #define BOARD_NAME "signal8"
 
 // system clock: 250 MHz (RP2350 stable max).
-// PL022 slave requires f_SSPCLK >= f_SCK/12; at 250 MHz with CPSR=2,
-// f_SSPCLK = 125 MHz -> max SPI slave clock = 10.42 MHz.
+// PL022 slave requires clk_peri >= 12 * f_SCK; at 250 MHz,
+// max SPI slave clock = 250 / 12 = 20.83 MHz.
 #define SYS_CLOCK_KHZ 250000
 
 // ---------------------------------------------------------------------------
