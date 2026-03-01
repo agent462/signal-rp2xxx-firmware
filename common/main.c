@@ -30,12 +30,14 @@
 #define WATCHDOG_MS 5000
 
 // frame dispatch struct: passed from core0 to core1 via FIFO pointer.
-// single pointer avoids needing multiple FIFO pushes and carries
-// both pixel and optional DMX parameters.
+// core0 pre-computes bitplane data; core1 just does DMA output.
 typedef struct {
-    const uint8_t *pixel_data;
-    uint32_t num_ports;
-    uint32_t pixels_per_port;
+    const uint32_t *bitplane_neo;
+    uint32_t num_words;
+#ifdef NUM_DIFF_PORTS
+    const uint32_t *bitplane_diff;
+    bool has_diff;
+#endif
 #ifdef PIN_DMX_TX
     bool dmx_present;
     const uint8_t *dmx_data;
@@ -43,9 +45,17 @@ typedef struct {
 #endif
 } frame_dispatch_t;
 
-// core1: bitplane transform + PIO WS281x output + optional DMX.
-// receives frame dispatch struct from core0 via multicore FIFO, transforms
-// pixel data into bitplane format, and DMA-feeds the PIO state machine(s).
+// double-buffered bitplane arrays: core0 writes one while core1 DMA-reads the other
+static uint32_t bitplane_neo[2][BITPLANE_WORDS(MAX_PIXELS)];
+static int bp_write = 0;
+
+#ifdef NUM_DIFF_PORTS
+static uint32_t bitplane_diff[2][BITPLANE_WORDS(MAX_PIXELS)];
+#endif
+
+// core1: PIO WS281x DMA output + optional DMX.
+// receives pre-computed bitplane data from core0 via multicore FIFO and
+// DMA-feeds the PIO state machine(s).
 static void core1_main(void) {
     // initialize native WS281x PIO output (pio0/SM0)
     static ws281x_ctx_t neo_ctx;
@@ -74,103 +84,56 @@ static void core1_main(void) {
     dmx_output_init(&dmx_ctx, pio2, 0, PIN_DMX_TX, PIN_DMX_DIR);
 #endif
 
-    static uint32_t bitplane_neo[BITPLANE_WORDS(MAX_PIXELS)];
-#ifdef NUM_DIFF_PORTS
-    static uint32_t bitplane_diff[BITPLANE_WORDS(MAX_PIXELS)];
-#endif
-
     // signal core0: PIO initialized, ready for frames
     multicore_fifo_push_blocking(CORE1_READY);
 
     while (true) {
         // block until core0 sends a frame dispatch struct pointer
         uint32_t dispatch_ptr = multicore_fifo_pop_blocking();
-        __mem_fence_acquire();  // ensure struct reads happen after pointer received
+        __mem_fence_acquire();
         const frame_dispatch_t *dispatch = (const frame_dispatch_t *)dispatch_ptr;
 
-        uint32_t num_ports = dispatch->num_ports;
-        uint32_t pixels_per_port = dispatch->pixels_per_port;
-        const uint8_t *pixel_data = dispatch->pixel_data;
+        uint32_t num_words = dispatch->num_words;
 
 #ifdef NUM_DIFF_PORTS
-        // native ports (0..NUM_PORTS-1): use standard transform for up to 8 ports
-        if (num_ports <= NUM_PORTS) {
-            bitplane_transform(pixel_data, bitplane_neo, num_ports, pixels_per_port);
-        } else {
-            // frame has more ports than native -- split: native gets ports 0..7
-            bitplane_transform_subset(pixel_data, bitplane_neo,
-                                      0, NUM_PORTS, pixels_per_port);
-            // differential gets ports 8..11
-            uint32_t diff_ports = num_ports - NUM_PORTS;
-            if (diff_ports > NUM_DIFF_PORTS) diff_ports = NUM_DIFF_PORTS;
-            bitplane_transform_subset(pixel_data, bitplane_diff,
-                                      NUM_PORTS, diff_ports, pixels_per_port);
-        }
-#else
-        bitplane_transform(pixel_data, bitplane_neo, num_ports, pixels_per_port);
-#endif
-
-#ifdef PIN_DMX_TX
-        // copy DMX data before signaling CORE1_DONE -- dmx_data points into
-        // the SPI buffer, which core0 will re-arm after receiving CORE1_DONE.
-        static uint8_t dmx_buf[512];
-        uint32_t dmx_buf_len = 0;
-        bool dmx_pending = false;
-        if (dispatch->dmx_present && dispatch->dmx_len <= sizeof(dmx_buf)) {
-            memcpy(dmx_buf, dispatch->dmx_data, dispatch->dmx_len);
-            dmx_buf_len = dispatch->dmx_len;
-            dmx_pending = true;
-        }
-#endif
-
-        // signal core0: done reading from SPI buffer, safe to re-arm DMA
-        multicore_fifo_push_blocking(CORE1_DONE);
-
-        uint32_t num_words = BITPLANE_WORDS(pixels_per_port);
-
-#ifdef NUM_DIFF_PORTS
-        if (num_ports > NUM_PORTS) {
-            // assert RS-485 direction for differential output
+        if (dispatch->has_diff) {
             gpio_put(PIN_DIFF_DIR, 1);
 
             // start both DMA transfers concurrently
-            dma_channel_set_read_addr(neo_ctx.dma_chan, bitplane_neo, false);
+            dma_channel_set_read_addr(neo_ctx.dma_chan, dispatch->bitplane_neo, false);
             dma_channel_set_trans_count(neo_ctx.dma_chan, num_words, true);
-            dma_channel_set_read_addr(diff_ctx.dma_chan, bitplane_diff, false);
+            dma_channel_set_read_addr(diff_ctx.dma_chan, dispatch->bitplane_diff, false);
             dma_channel_set_trans_count(diff_ctx.dma_chan, num_words, true);
 
-            // wait for both DMA transfers to complete
             dma_channel_wait_for_finish_blocking(neo_ctx.dma_chan);
             dma_channel_wait_for_finish_blocking(diff_ctx.dma_chan);
 
-            // wait for differential PIO to finish shifting out FIFO contents.
-            // DMA done = all words written to FIFO, not shifted to pins.
-            // FIFO depth is 4 words * 1.25µs/word = up to 5µs remaining.
+            // wait for differential PIO to finish shifting out FIFO contents
             while (!pio_sm_is_tx_fifo_empty(pio1, 0)) {
                 tight_loop_contents();
             }
-            sleep_us(40);  // final word shift-out (24 bits * 1.25µs ≈ 30µs + margin)
+            sleep_us(40);
 
-            // de-assert RS-485 direction
             gpio_put(PIN_DIFF_DIR, 0);
         } else {
-            // native only -- no differential output
-            ws281x_parallel_send(&neo_ctx, bitplane_neo, num_words);
+            ws281x_parallel_send(&neo_ctx, dispatch->bitplane_neo, num_words);
         }
 #else
-        ws281x_parallel_send(&neo_ctx, bitplane_neo, num_words);
+        ws281x_parallel_send(&neo_ctx, dispatch->bitplane_neo, num_words);
 #endif
 
 #ifdef PIN_DMX_TX
-        if (dmx_pending) {
-            dmx_output_send(&dmx_ctx, dmx_buf, dmx_buf_len);
+        if (dispatch->dmx_present) {
+            dmx_output_send(&dmx_ctx, dispatch->dmx_data, dispatch->dmx_len);
         }
 #endif
 
-        // WS281x latch: data is latched on >280us LOW (WS2812B spec).
-        // the next frame's SPI reception provides natural delay, but
-        // add a minimum guard for back-to-back frames.
+        // WS281x latch: data is latched on >280µs LOW (WS2812B spec).
+        // bitplane transform moved to core0, so explicit latch delay needed.
         sleep_us(300);
+
+        // signal core0: DMA complete, bitplane buffer safe to reuse
+        multicore_fifo_push_blocking(CORE1_DONE);
     }
 }
 
@@ -191,6 +154,7 @@ int main(void) {
     sleep_ms(2000);
     printf("=== signal %s (dual-core SPI+WS281x) ===\n", BOARD_NAME);
     printf("sys clock: %lu Hz\n", (unsigned long)clock_get_hz(clk_sys));
+    printf("peri clock: %lu Hz\n", (unsigned long)clock_get_hz(clk_peri));
 
     spi_slave_init();
     printf("SPI slave initialized\n");
@@ -207,14 +171,19 @@ int main(void) {
     // enable hardware watchdog (5s safety net for firmware hangs)
     watchdog_enable(WATCHDOG_MS, true);
 
-    // frame dispatch struct -- core1 reads pixel_data and copies dmx_data
-    // before signaling CORE1_DONE, so it's always valid.
     static frame_dispatch_t dispatch;
+#ifdef PIN_DMX_TX
+    static uint8_t dmx_buf[2][512];
+#endif
 
     uint32_t frame_count = 0;
     uint32_t error_count = 0;
     uint32_t last_frame_num = 0;
     uint32_t drop_count = 0;
+    uint64_t total_bytes = 0;
+    uint32_t err_counts[6] = {0};  // per-type: TOO_SHORT, BAD_SYNC, BAD_LENGTH, BAD_PORTS, BAD_CRC, ALIGNMENT
+    uint64_t stats_interval_start_us = time_us_64();
+    uint32_t interval_frames = 0;
     uint64_t last_valid_frame_us = time_us_64();
     bool timed_out = false;
 
@@ -247,6 +216,8 @@ int main(void) {
 
         if (result != FRAME_OK) {
             error_count++;
+            if (result >= FRAME_ERR_TOO_SHORT && result <= FRAME_ERR_ALIGNMENT)
+                err_counts[result - 1]++;
             status_led_set(STATUS_CRC_ERROR);
             status_led_update(error_count);
             // log first error and then every 100th to avoid serial flooding
@@ -259,6 +230,8 @@ int main(void) {
         }
 
         frame_count++;
+        total_bytes += len;
+        interval_frames++;
 #ifdef PIN_LED
         gpio_put(PIN_LED, frame_count & 1);
 #endif
@@ -286,35 +259,87 @@ int main(void) {
         }
         last_frame_num = info.frame_num;
 
-        // populate dispatch struct and hand to core1 via single FIFO push
-        dispatch.pixel_data = info.pixel_data;
-        dispatch.num_ports = info.num_ports;
-        dispatch.pixels_per_port = info.pixels_per_port;
+        // bitplane transform into write buffer (on core0, overlaps with core1 DMA)
+#ifdef NUM_DIFF_PORTS
+        if (info.num_ports <= NUM_PORTS) {
+            bitplane_transform(info.pixel_data, bitplane_neo[bp_write],
+                               info.num_ports, info.pixels_per_port);
+            dispatch.has_diff = false;
+        } else {
+            bitplane_transform_subset(info.pixel_data, bitplane_neo[bp_write],
+                                      0, NUM_PORTS, info.pixels_per_port);
+            uint32_t diff_ports = info.num_ports - NUM_PORTS;
+            if (diff_ports > NUM_DIFF_PORTS) diff_ports = NUM_DIFF_PORTS;
+            bitplane_transform_subset(info.pixel_data, bitplane_diff[bp_write],
+                                      NUM_PORTS, diff_ports, info.pixels_per_port);
+            dispatch.has_diff = true;
+        }
+#else
+        bitplane_transform(info.pixel_data, bitplane_neo[bp_write],
+                           info.num_ports, info.pixels_per_port);
+#endif
+
+        // copy DMX data from SPI buffer into staging buffer
 #ifdef PIN_DMX_TX
         dispatch.dmx_present = info.dmx_present;
-        dispatch.dmx_data = info.dmx_data;
-        dispatch.dmx_len = info.dmx_len;
+        if (info.dmx_present && info.dmx_len <= 512) {
+            memcpy(dmx_buf[bp_write], info.dmx_data, info.dmx_len);
+            dispatch.dmx_data = dmx_buf[bp_write];
+            dispatch.dmx_len = info.dmx_len;
+        }
 #endif
-        __mem_fence_release();  // ensure all struct writes complete before pointer is visible
-        multicore_fifo_push_blocking((uint32_t)&dispatch);
 
-        // wait for core1 to finish reading from the SPI buffer.
-        // core1 pushes CORE1_DONE after bitplane_transform() completes.
-        // PIO DMA output continues from core1's own bitplane buffer.
-        multicore_fifo_pop_blocking();
+        // populate dispatch struct with pre-computed bitplane pointers
+        dispatch.bitplane_neo = bitplane_neo[bp_write];
+        dispatch.num_words = BITPLANE_WORDS(info.pixels_per_port);
+#ifdef NUM_DIFF_PORTS
+        dispatch.bitplane_diff = bitplane_diff[bp_write];
+#endif
 
-        // re-arm SPI for next frame (swaps buffer, sets READY HIGH)
+        // SPI buffer fully consumed — re-arm DMA, READY goes HIGH.
+        // this lets the Pi start sending the next frame while we wait for core1.
         spi_slave_frame_consumed();
+
+        // wait for core1 to finish previous DMA (bitplane read buffer now safe)
+        if (frame_count > 1) {
+            multicore_fifo_pop_blocking();  // CORE1_DONE
+        }
+
+        // dispatch to core1
+        __mem_fence_release();
+        multicore_fifo_push_blocking((uint32_t)&dispatch);
+        bp_write ^= 1;
 
         // periodic stats (every 1000 frames, ~25s at 40fps)
         if (frame_count % 1000 == 0) {
-            printf("frames: %lu, errors: %lu, drops: %lu, "
-                   "ports: %lu, px/port: %lu\n",
+            uint64_t now_us = time_us_64();
+            uint64_t elapsed_us = now_us - stats_interval_start_us;
+            uint32_t fps_x10 = (elapsed_us > 0)
+                ? (uint32_t)((uint64_t)interval_frames * 10000000 / elapsed_us)
+                : 0;
+            uint32_t uptime_s = (uint32_t)(now_us / 1000000);
+
+            printf("[%lus] frames:%lu err:%lu drop:%lu fps:%lu.%lu bytes:%llu "
+                   "dma_rem:%lu fifo_extra:%lu "
+                   "err[sync:%lu crc:%lu len:%lu port:%lu align:%lu short:%lu]\n",
+                   (unsigned long)uptime_s,
                    (unsigned long)frame_count,
                    (unsigned long)error_count,
                    (unsigned long)drop_count,
-                   (unsigned long)info.num_ports,
-                   (unsigned long)info.pixels_per_port);
+                   (unsigned long)(fps_x10 / 10),
+                   (unsigned long)(fps_x10 % 10),
+                   (unsigned long long)total_bytes,
+                   (unsigned long)spi_slave_debug_remaining(),
+                   (unsigned long)spi_slave_debug_fifo_extra(),
+                   (unsigned long)err_counts[FRAME_ERR_BAD_SYNC - 1],
+                   (unsigned long)err_counts[FRAME_ERR_BAD_CRC - 1],
+                   (unsigned long)err_counts[FRAME_ERR_BAD_LENGTH - 1],
+                   (unsigned long)err_counts[FRAME_ERR_BAD_PORTS - 1],
+                   (unsigned long)err_counts[FRAME_ERR_ALIGNMENT - 1],
+                   (unsigned long)err_counts[FRAME_ERR_TOO_SHORT - 1]);
+
+            interval_frames = 0;
+            stats_interval_start_us = now_us;
         }
     }
 
