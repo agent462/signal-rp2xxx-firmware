@@ -67,22 +67,34 @@ frame_result_t frame_parse(const uint8_t *raw_data, uint32_t raw_len,
     if (total > raw_len || data_len > MAX_FRAME_SIZE)
         return FRAME_ERR_BAD_LENGTH;
 
-    // port count from flags bits 3:0
+    // protocol version from flags upper nibble
     uint32_t flags = raw_data[10];
-    uint32_t ports = flags & 0x0F;
+    uint32_t version = flags >> 4;
+    if (version != FRAME_PROTOCOL_VERSION)
+        return FRAME_ERR_VERSION;
+
+    // port mask (big-endian uint32 at bytes 11-14)
+    uint32_t port_mask = ((uint32_t)raw_data[11] << 24)
+                       | ((uint32_t)raw_data[12] << 16)
+                       | ((uint32_t)raw_data[13] << 8)
+                       | raw_data[14];
+
+    // validate mask: must be non-zero, no bits beyond board's port count
 #ifdef TOTAL_PORTS
-    if (ports == 0 || ports > TOTAL_PORTS)
+    uint32_t valid_mask = (1u << TOTAL_PORTS) - 1;
 #else
-    if (ports == 0 || ports > NUM_PORTS)
+    uint32_t valid_mask = (1u << NUM_PORTS) - 1;
 #endif
+    if (port_mask == 0 || (port_mask & ~valid_mask) != 0)
         return FRAME_ERR_BAD_PORTS;
 
 #ifndef PIN_DMX_TX
-    if (flags & FRAME_FLAG_DMX_BIT)
+    if (flags & FRAME_FLAG_DMX)
         return FRAME_ERR_BAD_PORTS;
 #endif
 
-    uint32_t stride = ports * 3;
+    uint32_t active_ports = __builtin_popcount(port_mask);
+    uint32_t stride = active_ports * 3;
 
     // determine pixel data length (may be less than data_len if DMX present)
     uint32_t pixel_data_len = data_len;
@@ -92,7 +104,7 @@ frame_result_t frame_parse(const uint8_t *raw_data, uint32_t raw_len,
     const uint8_t *dmx_data_ptr = NULL;
     bool dmx_present = false;
 
-    if (flags & FRAME_FLAG_DMX_BIT) {
+    if (flags & FRAME_FLAG_DMX) {
         // DMX layout within payload: [pixel_data(P)][dmx_data(D)][dmx_length(2)]
         // dmx_length is at the last 2 bytes of the payload, so it can be
         // located without knowing the pixel/DMX split point.
@@ -120,7 +132,7 @@ frame_result_t frame_parse(const uint8_t *raw_data, uint32_t raw_len,
     }
 #endif
 
-    // pixel data must divide evenly into (ports * 3 bytes/pixel)
+    // pixel data must divide evenly into (active_ports * 3 bytes/pixel)
     if (pixel_data_len == 0 || (pixel_data_len % stride) != 0)
         return FRAME_ERR_ALIGNMENT;
 
@@ -129,9 +141,9 @@ frame_result_t frame_parse(const uint8_t *raw_data, uint32_t raw_len,
         return FRAME_ERR_BAD_LENGTH;
 
     // CRC-16 over everything between sync and CRC:
-    // LENGTH(4) + FRAME_NUM(4) + FLAGS(1) + DATA(N) = 9 + data_len bytes
+    // LENGTH(4) + FRAME_NUM(4) + FLAGS(1) + PORT_MASK(4) + DATA(N) = 13 + data_len bytes
     const uint8_t *crc_start = raw_data + 2;
-    uint32_t crc_len = 9 + data_len;
+    uint32_t crc_len = 13 + data_len;
     uint16_t computed = crc16_ccitt(crc_start, crc_len);
     uint16_t received = ((uint16_t)raw_data[FRAME_HEADER_SIZE + data_len] << 8)
                       | raw_data[FRAME_HEADER_SIZE + data_len + 1];
@@ -144,7 +156,8 @@ frame_result_t frame_parse(const uint8_t *raw_data, uint32_t raw_len,
                     | ((uint32_t)raw_data[8] << 8)
                     | raw_data[9];
     info->data_len = pixel_data_len;
-    info->num_ports = ports;
+    info->port_mask = port_mask;
+    info->active_ports = active_ports;
     info->pixels_per_port = pixels_per_port;
     info->pixel_data = raw_data + FRAME_HEADER_SIZE;
 

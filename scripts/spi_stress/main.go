@@ -20,7 +20,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -82,9 +81,9 @@ func crc16CCITT(data []byte) uint16 {
 	return crc
 }
 
-// buildFrameInto fills buf with a framed packet and returns the total length.
-// Protocol: sync(2) + length(4) + frame_num(4) + flags(1) + data(N) + crc(2)
-func buildFrameInto(buf []byte, frameNum uint32, numPorts int, pixelData []byte) int {
+// buildFrameInto fills buf with a v2 framed packet and returns the total length.
+// Protocol v2: sync(2) + length(4) + frame_num(4) + flags(1) + port_mask(4) + data(N) + crc(2)
+func buildFrameInto(buf []byte, frameNum uint32, portMask uint32, pixelData []byte) int {
 	dataLen := len(pixelData)
 	// sync
 	buf[0] = 0xAA
@@ -93,13 +92,15 @@ func buildFrameInto(buf []byte, frameNum uint32, numPorts int, pixelData []byte)
 	binary.BigEndian.PutUint32(buf[2:6], uint32(dataLen))
 	// frame number (big-endian)
 	binary.BigEndian.PutUint32(buf[6:10], frameNum)
-	// flags
-	buf[10] = byte(numPorts & 0x0F)
+	// flags: upper nibble = protocol version 2, bit 0 = DMX (0 here)
+	buf[10] = 2 << 4
+	// port mask (big-endian)
+	binary.BigEndian.PutUint32(buf[11:15], portMask)
 	// pixel data
-	copy(buf[11:], pixelData)
-	// CRC over bytes 2..end (header[2:] + pixel_data)
-	crc := crc16CCITT(buf[2 : 11+dataLen])
-	end := 11 + dataLen
+	copy(buf[15:], pixelData)
+	// CRC over bytes 2..end (length + frame_num + flags + port_mask + pixel_data = 13 + dataLen)
+	crc := crc16CCITT(buf[2 : 15+dataLen])
+	end := 15 + dataLen
 	buf[end] = byte(crc >> 8)
 	buf[end+1] = byte(crc)
 	return end + 2
@@ -151,12 +152,17 @@ func (g *mmapGPIO) Close() {
 	syscall.Munmap(g.mem)
 }
 
-// waitReady waits for the READY pin to go HIGH. Returns false on timeout.
-func waitReady(gpio *mmapGPIO, timeout time.Duration) bool {
+// waitReady waits for the READY pin to go HIGH. Returns false on timeout or context cancellation.
+func waitReady(ctx context.Context, gpio *mmapGPIO, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for !gpio.Read() {
 		if time.Now().After(deadline) {
 			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		default:
 		}
 		time.Sleep(50 * time.Microsecond)
 	}
@@ -293,14 +299,14 @@ func generatePixelPatterns(numPorts, pixelsPerPort int, brightness float64) []pa
 
 // Minimal termios constants for linux/arm64
 const (
-	tcgets2    = 0x802C542A // _IOR('T', 0x2A, struct termios2)
-	tcsets2    = 0x402C542B // _IOW('T', 0x2B, struct termios2)
-	bother     = 0x1000
-	clocal     = 0x800
-	cread      = 0x80
-	cs8        = 0x30
-	vmin       = 6
-	vtime      = 5
+	tcgets2 = 0x802C542A // _IOR('T', 0x2A, struct termios2)
+	tcsets2 = 0x402C542B // _IOW('T', 0x2B, struct termios2)
+	bother  = 0x1000
+	clocal  = 0x800
+	cread   = 0x80
+	cs8     = 0x30
+	vmin    = 6
+	vtime   = 5
 )
 
 // termios2 matches the kernel's struct termios2 (44 bytes on arm64)
@@ -356,15 +362,19 @@ func openSerial(path string, baud int) (*os.File, error) {
 
 // --- Serial capture ---
 
-func serialCapture(ctx context.Context, serialPort, logFile string, wg *sync.WaitGroup) {
-	defer wg.Done()
-
+func serialCapture(ctx context.Context, serialPort, logFile string) {
 	f, err := openSerial(serialPort, 115200)
 	if err != nil {
 		fmt.Printf("  serial: could not open %s: %v\n", serialPort, err)
 		return
 	}
 	defer f.Close()
+
+	// close the fd when context cancels to unblock the blocking read
+	go func() {
+		<-ctx.Done()
+		f.Close()
+	}()
 
 	out, err := os.Create(logFile)
 	if err != nil {
@@ -374,25 +384,9 @@ func serialCapture(ctx context.Context, serialPort, logFile string, wg *sync.Wai
 	defer out.Close()
 
 	scanner := bufio.NewScanner(f)
-	done := ctx.Done()
-
-	for {
-		select {
-		case <-done:
-			return
-		default:
-		}
-		if scanner.Scan() {
-			ts := time.Now().Format("15:04:05")
-			fmt.Fprintf(out, "[%s] %s\n", ts, scanner.Text())
-		} else {
-			select {
-			case <-done:
-				return
-			default:
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
+	for scanner.Scan() {
+		ts := time.Now().Format("15:04:05")
+		fmt.Fprintf(out, "[%s] %s\n", ts, scanner.Text())
 	}
 }
 
@@ -411,6 +405,17 @@ func roundTo(v float64, decimals int) float64 {
 	return math.Round(v*p) / p
 }
 
+// isFlagSet returns true if a flag was explicitly provided on the command line.
+func isFlagSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
 // --- Main ---
 
 func main() {
@@ -423,7 +428,34 @@ func main() {
 	logDir := flag.String("log-dir", "./stress_logs", "output directory for logs")
 	speedSweep := flag.Bool("speed-sweep", false, "ramp SPI speed every 30min")
 	readyPin := flag.Int("ready-pin", 16, "BCM GPIO pin for READY")
+	fpsSweepStr := flag.String("fps-sweep", "", "FPS sweep range, e.g. 35-45")
+	fpsStep := flag.Int("fps-step", 120, "seconds per FPS step during sweep")
 	flag.Parse()
+
+	// Parse FPS sweep range
+	var fpsSweepStart, fpsSweepEnd int
+	fpsSweepEnabled := false
+	if *fpsSweepStr != "" {
+		parts := strings.SplitN(*fpsSweepStr, "-", 2)
+		if len(parts) != 2 {
+			fmt.Fprintf(os.Stderr, "error: --fps-sweep must be START-END, e.g. 35-45\n")
+			os.Exit(1)
+		}
+		var err1, err2 error
+		fpsSweepStart, err1 = strconv.Atoi(parts[0])
+		fpsSweepEnd, err2 = strconv.Atoi(parts[1])
+		if err1 != nil || err2 != nil || fpsSweepStart < 1 || fpsSweepEnd < fpsSweepStart {
+			fmt.Fprintf(os.Stderr, "error: --fps-sweep invalid range %q\n", *fpsSweepStr)
+			os.Exit(1)
+		}
+		fpsSweepEnabled = true
+		*fps = fpsSweepStart
+		// Auto-set duration to cover entire sweep if user didn't override
+		sweepDuration := (fpsSweepEnd - fpsSweepStart + 1) * *fpsStep
+		if !isFlagSet("duration") {
+			*duration = sweepDuration
+		}
+	}
 
 	// Create timestamped log directory
 	runName := time.Now().Format("2006-01-02_150405")
@@ -452,24 +484,40 @@ func main() {
 	}
 	defer spi.Close()
 
-	// Start serial capture
-	ctx, cancel := context.WithCancel(context.Background())
-	var serialWg sync.WaitGroup
-	serialWg.Add(1)
-	go serialCapture(ctx, *serialPort, serialLog, &serialWg)
+	// Signal handling: first Ctrl+C triggers graceful shutdown, second forces exit
+	mainCtx, mainCancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Println("\n  shutting down...")
+		mainCancel()
+		<-sigCh
+		fmt.Println("\n  forced exit")
+		os.Exit(1)
+	}()
+
+	// Start serial capture (child of mainCtx so Ctrl+C stops it too)
+	serialCtx, serialCancel := context.WithCancel(mainCtx)
+	_ = serialCancel // called implicitly via mainCancel; process exit cleans up
+	go serialCapture(serialCtx, *serialPort, serialLog)
 
 	// Stats
 	currentSpeed := *speed
 	var totalFrames uint32
 	var readyTimeouts int
 	startTime := time.Now()
-	lastSummaryTime := startTime
+	nextSummaryTime := startTime.Add(60 * time.Second)
 	sweepStartTime := startTime
 	tierIndex := 0
 
+	// Per-step FPS tracking (reset at each FPS sweep step)
+	stepStartTime := startTime
+	var stepFrames uint32
+
 	framePeriod := time.Duration(float64(time.Second) / float64(*fps))
 	bytesPerFrame := *ports * *pixels * 3
-	pktSize := bytesPerFrame + 13
+	pktSize := bytesPerFrame + 17 // v2 header(15) + CRC(2)
 
 	// Check spidev bufsiz
 	bufsizPath := "/sys/module/spidev/parameters/bufsiz"
@@ -495,10 +543,16 @@ func main() {
 		sweepStr = "ON (" + strings.Join(parts, ", ") + ")"
 	}
 
+	fpsSweepStr2 := "OFF"
+	if fpsSweepEnabled {
+		fpsSweepStr2 = fmt.Sprintf("ON (%d-%d fps, %ds/step)", fpsSweepStart, fpsSweepEnd, *fpsStep)
+	}
+	currentFPS := *fps
+
 	// Write run parameters to params.json for the report script
 	paramsJSON := fmt.Sprintf(
-		`{"spi_mhz":%.1f,"ports":%d,"pixels":%d,"bytes_per_frame":%d,"target_fps":%d,"duration_s":%d,"speed_sweep":%v,"ready_pin":%d,"serial_port":%q}`+"\n",
-		float64(currentSpeed)/1e6, *ports, *pixels, bytesPerFrame, *fps, *duration, *speedSweep, *readyPin, *serialPort)
+		`{"spi_mhz":%.1f,"ports":%d,"pixels":%d,"bytes_per_frame":%d,"target_fps":%d,"duration_s":%d,"speed_sweep":%v,"fps_sweep":%q,"fps_step":%d,"ready_pin":%d,"serial_port":%q}`+"\n",
+		float64(currentSpeed)/1e6, *ports, *pixels, bytesPerFrame, *fps, *duration, *speedSweep, *fpsSweepStr, *fpsStep, *readyPin, *serialPort)
 	os.WriteFile(filepath.Join(logPath, "params.json"), []byte(paramsJSON), 0644)
 
 	fmt.Println("=== SPI STRESS TEST ===")
@@ -506,15 +560,14 @@ func main() {
 	fmt.Printf("Config:   %d ports x %d px = %d bytes/frame\n", *ports, *pixels, bytesPerFrame)
 	fmt.Printf("Target:   %d fps for %s\n", *fps, formatDuration(float64(*duration)))
 	fmt.Printf("Sweep:    %s\n", sweepStr)
+	fmt.Printf("FPS:      %s\n", fpsSweepStr2)
 	fmt.Printf("Logs:     %s/\n", logPath)
 	fmt.Println()
 
 	// Wait for initial READY
 	fmt.Print("waiting for READY...")
-	if !waitReady(gpio, 10*time.Second) {
+	if !waitReady(mainCtx, gpio, 10*time.Second) {
 		fmt.Println(" timeout! check wiring and firmware.")
-		cancel()
-		serialWg.Wait()
 		os.Exit(1)
 	}
 	fmt.Println(" ok")
@@ -528,42 +581,30 @@ func main() {
 	}
 	time.Sleep(500 * time.Millisecond)
 
+	// Port mask: all ports active (bits 0..ports-1 set)
+	portMask := uint32((1 << *ports) - 1)
+
 	// Pre-generate pixel patterns and frame buffer
 	patterns := generatePixelPatterns(*ports, *pixels, 0.3)
 	frameBuf := make([]byte, pktSize)
 	numPatterns := len(patterns)
 
-	fmt.Printf("  streaming at %d fps...\n\n", *fps)
-
-	// Signal handling
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	fmt.Printf("  streaming at %d fps...\n\n", currentFPS)
 
 	// Open log file
 	logFile, err := os.Create(senderLog)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error creating log: %v\n", err)
-		cancel()
-		serialWg.Wait()
 		os.Exit(1)
 	}
 	logWriter := bufio.NewWriterSize(logFile, 64*1024)
 
-	shutdown := false
 	testDeadline := startTime.Add(time.Duration(*duration) * time.Second)
 
-	for !shutdown {
+	for mainCtx.Err() == nil {
 		// Check duration
 		if time.Now().After(testDeadline) {
 			break
-		}
-
-		// Check signals (non-blocking)
-		select {
-		case <-sigCh:
-			shutdown = true
-			continue
-		default:
 		}
 
 		// Speed sweep
@@ -581,11 +622,41 @@ func main() {
 			}
 		}
 
+		// Periodic console summary (every 60s, anchored to startTime to avoid drift)
+		if stepFrames > 0 && time.Now().After(nextSummaryTime) {
+			now := time.Now()
+			stepElapsed := now.Sub(stepStartTime).Seconds()
+			stepFPS := float64(stepFrames) / stepElapsed
+			ts := formatDuration(now.Sub(startTime).Seconds())
+			fmt.Printf("  [%s] sent:%d ready_timeout:%d fps:%.1f target_fps:%d spi:%.0fMHz\n",
+				ts, totalFrames, readyTimeouts, stepFPS, currentFPS, float64(currentSpeed)/1e6)
+			nextSummaryTime = nextSummaryTime.Add(60 * time.Second)
+			logWriter.Flush()
+		}
+
+		// FPS sweep
+		if fpsSweepEnabled {
+			elapsed := time.Since(startTime).Seconds()
+			step := int(elapsed / float64(*fpsStep))
+			newFPS := fpsSweepStart + step
+			if newFPS > fpsSweepEnd {
+				break // sweep complete
+			}
+			if newFPS != currentFPS {
+				currentFPS = newFPS
+				framePeriod = time.Duration(float64(time.Second) / float64(currentFPS))
+				stepStartTime = time.Now()
+				stepFrames = 0
+				fmt.Printf("  [fps-sweep] %d fps (step %d/%d)\n",
+					currentFPS, step+1, fpsSweepEnd-fpsSweepStart+1)
+			}
+		}
+
 		frameStart := time.Now()
 
 		// Wait for READY
 		readyStart := time.Now()
-		if !waitReady(gpio, 500*time.Millisecond) {
+		if !waitReady(mainCtx, gpio, 20*time.Millisecond) {
 			readyTimeouts++
 			t := roundTo(time.Since(startTime).Seconds(), 3)
 			spiMhz := roundTo(float64(currentSpeed)/1e6, 1)
@@ -596,8 +667,9 @@ func main() {
 		readyMs := time.Since(readyStart).Seconds() * 1000
 
 		totalFrames++
+		stepFrames++
 		pixelData := patterns[int(totalFrames)%numPatterns].data
-		pktLen := buildFrameInto(frameBuf, totalFrames, *ports, pixelData)
+		pktLen := buildFrameInto(frameBuf, totalFrames, portMask, pixelData)
 
 		if err := spi.transfer(frameBuf[:pktLen]); err != nil {
 			fmt.Fprintf(os.Stderr, "  spi transfer error: %v\n", err)
@@ -607,20 +679,8 @@ func main() {
 		t := roundTo(time.Since(startTime).Seconds(), 3)
 		rMs := roundTo(readyMs, 2)
 		spiMhz := roundTo(float64(currentSpeed)/1e6, 1)
-		fmt.Fprintf(logWriter, `{"t":%.3f,"frame":%d,"bytes":%d,"ready_ms":%.2f,"spi_mhz":%.1f}`+"\n",
-			t, totalFrames, pktLen, rMs, spiMhz)
-
-		// Periodic console summary (every 60s)
-		now := time.Now()
-		if now.Sub(lastSummaryTime) >= 60*time.Second {
-			runElapsed := now.Sub(startTime).Seconds()
-			avgFPS := float64(totalFrames) / runElapsed
-			ts := formatDuration(runElapsed)
-			fmt.Printf("  [%s] sent:%d ready_timeout:%d avg_fps:%.1f spi:%.0fMHz\n",
-				ts, totalFrames, readyTimeouts, avgFPS, float64(currentSpeed)/1e6)
-			lastSummaryTime = now
-			logWriter.Flush()
-		}
+		fmt.Fprintf(logWriter, `{"t":%.3f,"frame":%d,"bytes":%d,"ready_ms":%.2f,"spi_mhz":%.1f,"target_fps":%d}`+"\n",
+			t, totalFrames, pktLen, rMs, spiMhz, currentFPS)
 
 		// Pace to target FPS: sleep most of the remaining time, busy-wait the last 500us
 		frameElapsed := time.Since(frameStart)
@@ -628,8 +688,8 @@ func main() {
 		if remaining > 500*time.Microsecond {
 			time.Sleep(remaining - 500*time.Microsecond)
 		}
-		// Busy-wait for precision
-		for time.Since(frameStart) < framePeriod {
+		// Busy-wait for precision (check context to allow Ctrl+C escape)
+		for time.Since(frameStart) < framePeriod && mainCtx.Err() == nil {
 			// spin
 		}
 	}
@@ -638,13 +698,8 @@ func main() {
 	logWriter.Flush()
 	logFile.Close()
 
-	// Stop serial capture
-	cancel()
-	serialWg.Wait()
-
 	// Final summary
-	endTime := time.Now()
-	dur := endTime.Sub(startTime).Seconds()
+	dur := time.Since(startTime).Seconds()
 	avgFPS := float64(totalFrames) / dur
 	totalData := int(totalFrames) * pktSize
 
@@ -657,4 +712,8 @@ func main() {
 	fmt.Printf("SPI speed:      %.0f MHz\n", float64(currentSpeed)/1e6)
 	fmt.Printf("Total bytes:    %d\n", totalData)
 	fmt.Printf("Log files:      %s/\n", logPath)
+
+	// Exit immediately -- serial capture goroutine uses blocking I/O
+	// that can't be reliably interrupted, so let process exit clean it up.
+	os.Exit(0)
 }

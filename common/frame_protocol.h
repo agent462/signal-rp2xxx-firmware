@@ -4,41 +4,49 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// frame header layout:
-// [0:1]   sync word 0xAA55
-// [2:5]   data length (big-endian uint32, total payload bytes)
-// [6:9]   frame number (big-endian uint32, monotonic counter)
-// [10]    flags: bits 3:0 = port count (1-15), bit 4 = DMX data follows
-// [11..]  pixel data (port-sequential: all port0 pixels, then port1, ...)
-// if flags bit 4 set:
-//   [11 .. 11+P-1]        pixel data (P bytes, stride-aligned)
-//   [11+P .. 11+P+D-1]    DMX channel data (D bytes, 1-512)
-//   [11+P+D .. 11+P+D+1]  DMX data length D (big-endian, 2 bytes)
+// frame header layout (v2, 15 bytes):
+// [0:1]     sync word 0xAA55
+// [2:5]     data length (big-endian uint32, pixel data for active ports only)
+// [6:9]     frame number (big-endian uint32, monotonic counter)
+// [10]      flags: bits 7:4 = protocol version (2), bit 0 = DMX data follows
+// [11:14]   port mask (big-endian uint32, bit i set = port i has pixel data)
+// [15..]    pixel data (active ports only, lowest bit first in mask order)
+// if flags bit 0 set:
+//   [15 .. 15+P-1]        pixel data (P bytes, stride-aligned)
+//   [15+P .. 15+P+D-1]    DMX channel data (D bytes, 1-512)
+//   [15+P+D .. 15+P+D+1]  DMX data length D (big-endian, 2 bytes)
 // [end-1 : end] CRC-16-CCITT (big-endian)
 //
-// CRC covers bytes 2 through end-2 (LENGTH + FRAME_NUM + FLAGS + all DATA).
+// CRC covers bytes 2 through end-2 (LENGTH + FRAME_NUM + FLAGS + PORT_MASK + all DATA).
 // sync word is excluded (known constant adds no validation value).
+//
+// port mask: only ports with changed pixel data are included in the frame.
+// firmware maintains a persistent pixel_state buffer; unchanged ports keep
+// their last data. active_ports = popcount(port_mask).
 
-#define SYNC_WORD         0xAA55
-#define FRAME_HEADER_SIZE 11 // sync(2) + length(4) + frame_num(4) + flags(1)
-#define FRAME_CRC_SIZE    2
-#define FRAME_FLAG_DMX_BIT 0x10  // flags bit 4: DMX data follows pixel data
+#define SYNC_WORD              0xAA55
+#define FRAME_HEADER_SIZE      15 // sync(2) + length(4) + frame_num(4) + flags(1) + port_mask(4)
+#define FRAME_CRC_SIZE         2
+#define FRAME_PROTOCOL_VERSION 2
+#define FRAME_FLAG_DMX         0x01  // flags bit 0: DMX data follows pixel data
 
 typedef enum {
     FRAME_OK = 0,
     FRAME_ERR_TOO_SHORT,   // fewer bytes than minimum frame (header + CRC)
     FRAME_ERR_BAD_SYNC,    // sync word mismatch
     FRAME_ERR_BAD_LENGTH,  // data length exceeds buffer or max frame size
-    FRAME_ERR_BAD_PORTS,   // port count 0 or > NUM_PORTS
+    FRAME_ERR_BAD_PORTS,   // port mask invalid (zero or bits beyond board's port count)
     FRAME_ERR_BAD_CRC,     // CRC-16 mismatch
-    FRAME_ERR_ALIGNMENT,   // data length not divisible by (ports * 3)
+    FRAME_ERR_ALIGNMENT,   // data length not divisible by (active_ports * 3)
+    FRAME_ERR_VERSION,     // protocol version mismatch
 } frame_result_t;
 
 typedef struct {
-    uint32_t frame_num;       // monotonic frame counter from sender
-    uint32_t data_len;        // pixel data length in bytes
-    uint32_t num_ports;       // LED port count (from flags bits 3:0)
-    uint32_t pixels_per_port; // derived: data_len / (num_ports * 3)
+    uint32_t frame_num;        // monotonic frame counter from sender
+    uint32_t data_len;         // pixel data length in bytes (active ports only)
+    uint32_t port_mask;        // bitmask of ports with pixel data in this frame
+    uint32_t active_ports;     // popcount of port_mask
+    uint32_t pixels_per_port;  // derived: data_len / (active_ports * 3)
     const uint8_t *pixel_data; // pointer into raw buffer at pixel data start
 #ifdef PIN_DMX_TX
     bool dmx_present;          // true if DMX data follows pixel data

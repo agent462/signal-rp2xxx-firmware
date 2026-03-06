@@ -9,8 +9,8 @@
 #include <string.h>
 
 // max protocol overhead for buffer sizing:
-// sync(2) + length(4) + frame_num(4) + flags(1) + crc(2) = 13
-#define PROTOCOL_OVERHEAD 13
+// sync(2) + length(4) + frame_num(4) + flags(1) + port_mask(4) + crc(2) = 17
+#define PROTOCOL_OVERHEAD 17
 #define RX_BUF_SIZE (MAX_FRAME_SIZE + PROTOCOL_OVERHEAD)
 
 // double buffers: DMA fills one while main loop processes the other.
