@@ -53,6 +53,14 @@ static int bp_write = 0;
 static uint32_t bitplane_diff[2][BITPLANE_WORDS(MAX_PIXELS)];
 #endif
 
+// persistent pixel state: holds all ports' data so unchanged ports retain
+// their last values when v2 port mask sends only active ports.
+#ifndef TOTAL_PORTS
+#define TOTAL_PORTS NUM_PORTS
+#endif
+static uint8_t pixel_state[TOTAL_PORTS * MAX_PIXELS * 3];
+static uint32_t state_pixels_per_port = 0;
+
 // core1: PIO WS281x DMA output + optional DMX.
 // receives pre-computed bitplane data from core0 via multicore FIFO and
 // DMA-feeds the PIO state machine(s).
@@ -181,7 +189,7 @@ int main(void) {
     uint32_t last_frame_num = 0;
     uint32_t drop_count = 0;
     uint64_t total_bytes = 0;
-    uint32_t err_counts[6] = {0};  // per-type: TOO_SHORT, BAD_SYNC, BAD_LENGTH, BAD_PORTS, BAD_CRC, ALIGNMENT
+    uint32_t err_counts[7] = {0};  // per-type: TOO_SHORT, BAD_SYNC, BAD_LENGTH, BAD_PORTS, BAD_CRC, ALIGNMENT, VERSION
     uint64_t stats_interval_start_us = time_us_64();
     uint32_t interval_frames = 0;
     uint64_t last_valid_frame_us = time_us_64();
@@ -216,14 +224,21 @@ int main(void) {
 
         if (result != FRAME_OK) {
             error_count++;
-            if (result >= FRAME_ERR_TOO_SHORT && result <= FRAME_ERR_ALIGNMENT)
+            if (result >= FRAME_ERR_TOO_SHORT && result <= FRAME_ERR_VERSION)
                 err_counts[result - 1]++;
             status_led_set(STATUS_CRC_ERROR);
             status_led_update(error_count);
             // log first error and then every 100th to avoid serial flooding
             if (error_count == 1 || error_count % 100 == 0) {
-                printf("frame error %d, total errors: %lu\n",
-                       result, (unsigned long)error_count);
+                if (result == FRAME_ERR_VERSION) {
+                    uint32_t recv_ver = (len >= 11) ? (data[10] >> 4) : 0;
+                    printf("version mismatch: got %lu, expected %d, total errors: %lu\n",
+                           (unsigned long)recv_ver, FRAME_PROTOCOL_VERSION,
+                           (unsigned long)error_count);
+                } else {
+                    printf("frame error %d, total errors: %lu\n",
+                           result, (unsigned long)error_count);
+                }
             }
             spi_slave_frame_consumed();
             continue;
@@ -259,25 +274,24 @@ int main(void) {
         }
         last_frame_num = info.frame_num;
 
-        // bitplane transform into write buffer (on core0, overlaps with core1 DMA)
-#ifdef NUM_DIFF_PORTS
-        if (info.num_ports <= NUM_PORTS) {
-            bitplane_transform(info.pixel_data, bitplane_neo[bp_write],
-                               info.num_ports, info.pixels_per_port);
-            dispatch.has_diff = false;
-        } else {
-            bitplane_transform_subset(info.pixel_data, bitplane_neo[bp_write],
-                                      0, NUM_PORTS, info.pixels_per_port);
-            uint32_t diff_ports = info.num_ports - NUM_PORTS;
-            if (diff_ports > NUM_DIFF_PORTS) diff_ports = NUM_DIFF_PORTS;
-            bitplane_transform_subset(info.pixel_data, bitplane_diff[bp_write],
-                                      NUM_PORTS, diff_ports, info.pixels_per_port);
-            dispatch.has_diff = true;
+        // on pixels_per_port change, clear pixel_state so stale data doesn't persist
+        if (info.pixels_per_port != state_pixels_per_port) {
+            memset(pixel_state, 0, sizeof(pixel_state));
+            state_pixels_per_port = info.pixels_per_port;
         }
-#else
-        bitplane_transform(info.pixel_data, bitplane_neo[bp_write],
-                           info.num_ports, info.pixels_per_port);
-#endif
+
+        // scatter-copy: unpack active ports' pixel data into persistent pixel_state
+        {
+            uint32_t mask = info.port_mask;
+            const uint8_t *src = info.pixel_data;
+            uint32_t bytes_per_port = info.pixels_per_port * 3;
+            while (mask) {
+                uint32_t port = __builtin_ctz(mask);
+                memcpy(&pixel_state[port * bytes_per_port], src, bytes_per_port);
+                src += bytes_per_port;
+                mask &= mask - 1;
+            }
+        }
 
         // copy DMX data from SPI buffer into staging buffer
 #ifdef PIN_DMX_TX
@@ -289,16 +303,30 @@ int main(void) {
         }
 #endif
 
+        // SPI buffer fully consumed — re-arm DMA, READY goes HIGH.
+        // scatter-copy and DMX copy are done; nothing below reads the SPI buffer.
+        // raising READY early lets the Pi send the next frame while we do
+        // the bitplane transform and wait for core1.
+        spi_slave_frame_consumed();
+
+        // bitplane transform into write buffer (on core0, overlaps with SPI reception)
+#ifdef NUM_DIFF_PORTS
+        bitplane_transform_subset(pixel_state, bitplane_neo[bp_write],
+                                  0, NUM_PORTS, state_pixels_per_port);
+        bitplane_transform_subset(pixel_state, bitplane_diff[bp_write],
+                                  NUM_PORTS, NUM_DIFF_PORTS, state_pixels_per_port);
+        dispatch.has_diff = true;
+#else
+        bitplane_transform(pixel_state, bitplane_neo[bp_write],
+                           NUM_PORTS, state_pixels_per_port);
+#endif
+
         // populate dispatch struct with pre-computed bitplane pointers
         dispatch.bitplane_neo = bitplane_neo[bp_write];
         dispatch.num_words = BITPLANE_WORDS(info.pixels_per_port);
 #ifdef NUM_DIFF_PORTS
         dispatch.bitplane_diff = bitplane_diff[bp_write];
 #endif
-
-        // SPI buffer fully consumed — re-arm DMA, READY goes HIGH.
-        // this lets the Pi start sending the next frame while we wait for core1.
-        spi_slave_frame_consumed();
 
         // wait for core1 to finish previous DMA (bitplane read buffer now safe)
         if (frame_count > 1) {
@@ -321,7 +349,7 @@ int main(void) {
 
             printf("[%lus] frames:%lu err:%lu drop:%lu fps:%lu.%lu bytes:%llu "
                    "dma_rem:%lu fifo_extra:%lu "
-                   "err[sync:%lu crc:%lu len:%lu port:%lu align:%lu short:%lu]\n",
+                   "err[sync:%lu crc:%lu len:%lu port:%lu align:%lu short:%lu ver:%lu]\n",
                    (unsigned long)uptime_s,
                    (unsigned long)frame_count,
                    (unsigned long)error_count,
@@ -336,7 +364,8 @@ int main(void) {
                    (unsigned long)err_counts[FRAME_ERR_BAD_LENGTH - 1],
                    (unsigned long)err_counts[FRAME_ERR_BAD_PORTS - 1],
                    (unsigned long)err_counts[FRAME_ERR_ALIGNMENT - 1],
-                   (unsigned long)err_counts[FRAME_ERR_TOO_SHORT - 1]);
+                   (unsigned long)err_counts[FRAME_ERR_TOO_SHORT - 1],
+                   (unsigned long)err_counts[FRAME_ERR_VERSION - 1]);
 
             interval_frames = 0;
             stats_interval_start_us = now_us;
