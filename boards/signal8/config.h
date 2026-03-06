@@ -4,10 +4,10 @@
 // board identity
 #define BOARD_NAME "signal8"
 
-// system clock: 250 MHz (RP2350 stable max).
-// PL022 slave requires clk_peri >= 12 * f_SCK; at 250 MHz,
-// max SPI slave clock = 250 / 12 = 20.83 MHz.
-#define SYS_CLOCK_KHZ 250000
+// system clock: 288 MHz (48 * 6, clean USB divisor).
+// PL022 slave requires clk_peri >= 12 * f_SCK; at 288 MHz,
+// max SPI slave clock = 288 / 12 = 24 MHz.
+#define SYS_CLOCK_KHZ 288000
 
 // ---------------------------------------------------------------------------
 // Native pixel outputs (8x Phoenix connectors via 74HCT245 level shifter)
