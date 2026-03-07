@@ -18,7 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
+"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -146,6 +146,11 @@ func gpioOpen(pin int) (*mmapGPIO, error) {
 func (g *mmapGPIO) Read() bool {
 	level := *(*uint32)(unsafe.Pointer(&g.mem[g.reg]))
 	return (level & g.mask) != 0
+}
+
+// ReadRaw returns the full GPLEV register value (all 32 GPIO pins)
+func (g *mmapGPIO) ReadRaw() uint32 {
+	return *(*uint32)(unsafe.Pointer(&g.mem[g.reg]))
 }
 
 func (g *mmapGPIO) Close() {
@@ -430,6 +435,7 @@ func main() {
 	readyPin := flag.Int("ready-pin", 16, "BCM GPIO pin for READY")
 	fpsSweepStr := flag.String("fps-sweep", "", "FPS sweep range, e.g. 35-45")
 	fpsStep := flag.Int("fps-step", 120, "seconds per FPS step during sweep")
+	debug := flag.Bool("debug", false, "enable timing diagnostics on timeout")
 	flag.Parse()
 
 	// Parse FPS sweep range
@@ -601,6 +607,39 @@ func main() {
 
 	testDeadline := startTime.Add(time.Duration(*duration) * time.Second)
 
+	// debug timing: track timestamps from previous iteration to diagnose stalls
+	var dbgLastIterEnd time.Time       // when the previous loop iteration ended
+	var dbgLastSPIDone time.Time       // when the previous SPI transfer completed
+	var dbgLastPaceSleep time.Duration // how long the previous pacing sleep was requested
+	var dbgLastTimeoutFrame uint32     // frame number of last logged timeout_debug
+
+	// accumulate ALL log entries in memory — zero I/O in hot path.
+	// fmt.Fprintf to a file-backed bufio.Writer triggers SD card flushes
+	// (10-50ms) that cause READY timeouts. dump everything at end instead.
+	type frameLog struct {
+		t         float64
+		frame     uint32
+		bytes     int
+		readyMs   float64
+		spiMhz    float64
+		targetFPS int
+		isTimeout bool
+	}
+	frameLogs := make([]frameLog, 0, *fps**duration+1000)
+
+	// debug: accumulate timeout diagnostics in memory, dump at end
+	type timeoutDiag struct {
+		t             float64
+		frame         uint32
+		gpioAtEntry   bool
+		rawGPLEV      uint32  // full GPLEV0 register at timeout
+		sinceIterEnd  float64 // ms
+		sinceSPIDone  float64 // ms
+		loopTop       float64 // ms
+		prevPaceReq   float64 // ms
+	}
+	var dbgDiags []timeoutDiag
+
 	for mainCtx.Err() == nil {
 		// Check duration
 		if time.Now().After(testDeadline) {
@@ -631,7 +670,6 @@ func main() {
 			fmt.Printf("  [%s] sent:%d ready_timeout:%d fps:%.1f target_fps:%d spi:%.0fMHz\n",
 				ts, totalFrames, readyTimeouts, stepFPS, currentFPS, float64(currentSpeed)/1e6)
 			nextSummaryTime = nextSummaryTime.Add(60 * time.Second)
-			logWriter.Flush()
 		}
 
 		// FPS sweep
@@ -656,12 +694,39 @@ func main() {
 
 		// Wait for READY
 		readyStart := time.Now()
+		gpioAtEntry := gpio.Read() // capture raw GPIO state before polling
 		if !waitReady(mainCtx, gpio, 20*time.Millisecond) {
 			readyTimeouts++
 			t := roundTo(time.Since(startTime).Seconds(), 3)
 			spiMhz := roundTo(float64(currentSpeed)/1e6, 1)
-			fmt.Fprintf(logWriter, `{"t":%.3f,"frame":%d,"event":"ready_timeout","spi_mhz":%.1f}`+"\n",
-				t, totalFrames+1, spiMhz)
+			frameLogs = append(frameLogs, frameLog{
+				t: t, frame: totalFrames + 1, spiMhz: spiMhz,
+				targetFPS: currentFPS, isTimeout: true,
+			})
+
+			// debug: capture timing context in memory (zero I/O in hot path)
+			if *debug && (readyTimeouts == 1 || totalFrames+1 != dbgLastTimeoutFrame) {
+				dbgLastTimeoutFrame = totalFrames + 1
+				sinceIterEnd := float64(0)
+				if !dbgLastIterEnd.IsZero() {
+					sinceIterEnd = time.Since(dbgLastIterEnd).Seconds() * 1000
+				}
+				sinceSPIDone := float64(0)
+				if !dbgLastSPIDone.IsZero() {
+					sinceSPIDone = time.Since(dbgLastSPIDone).Seconds() * 1000
+				}
+				loopTop := readyStart.Sub(frameStart).Seconds() * 1000
+				dbgDiags = append(dbgDiags, timeoutDiag{
+					t:            t,
+					frame:        totalFrames + 1,
+					gpioAtEntry:  gpioAtEntry,
+					rawGPLEV:     gpio.ReadRaw(),
+					sinceIterEnd: sinceIterEnd,
+					sinceSPIDone: sinceSPIDone,
+					loopTop:      loopTop,
+					prevPaceReq:  float64(dbgLastPaceSleep) / float64(time.Millisecond),
+				})
+			}
 			continue
 		}
 		readyMs := time.Since(readyStart).Seconds() * 1000
@@ -674,24 +739,58 @@ func main() {
 		if err := spi.transfer(frameBuf[:pktLen]); err != nil {
 			fmt.Fprintf(os.Stderr, "  spi transfer error: %v\n", err)
 		}
+		dbgLastSPIDone = time.Now()
 
-		// Log frame
+		// Log frame (in memory — no I/O in hot path)
 		t := roundTo(time.Since(startTime).Seconds(), 3)
 		rMs := roundTo(readyMs, 2)
 		spiMhz := roundTo(float64(currentSpeed)/1e6, 1)
-		fmt.Fprintf(logWriter, `{"t":%.3f,"frame":%d,"bytes":%d,"ready_ms":%.2f,"spi_mhz":%.1f,"target_fps":%d}`+"\n",
-			t, totalFrames, pktLen, rMs, spiMhz, currentFPS)
+		frameLogs = append(frameLogs, frameLog{
+			t: t, frame: totalFrames, bytes: pktLen,
+			readyMs: rMs, spiMhz: spiMhz, targetFPS: currentFPS,
+		})
 
 		// Pace to target FPS: sleep most of the remaining time, busy-wait the last 500us
 		frameElapsed := time.Since(frameStart)
 		remaining := framePeriod - frameElapsed
+		dbgLastPaceSleep = 0
 		if remaining > 500*time.Microsecond {
-			time.Sleep(remaining - 500*time.Microsecond)
+			dbgLastPaceSleep = remaining - 500*time.Microsecond
+			time.Sleep(dbgLastPaceSleep)
 		}
 		// Busy-wait for precision (check context to allow Ctrl+C escape)
 		for time.Since(frameStart) < framePeriod && mainCtx.Err() == nil {
 			// spin
 		}
+		dbgLastIterEnd = time.Now()
+	}
+
+	// Write all accumulated log entries to disk (deferred from hot path)
+	fmt.Printf("  writing %d log entries...\n", len(frameLogs))
+	for _, fl := range frameLogs {
+		if fl.isTimeout {
+			fmt.Fprintf(logWriter, `{"t":%.3f,"frame":%d,"event":"ready_timeout","spi_mhz":%.1f}`+"\n",
+				fl.t, fl.frame, fl.spiMhz)
+		} else {
+			fmt.Fprintf(logWriter, `{"t":%.3f,"frame":%d,"bytes":%d,"ready_ms":%.2f,"spi_mhz":%.1f,"target_fps":%d}`+"\n",
+				fl.t, fl.frame, fl.bytes, fl.readyMs, fl.spiMhz, fl.targetFPS)
+		}
+	}
+
+	// Write debug diagnostics
+	if *debug && len(dbgDiags) > 0 {
+		for _, d := range dbgDiags {
+			fmt.Fprintf(logWriter,
+				`{"t":%.3f,"frame":%d,"event":"timeout_debug","gpio_at_entry":%v,`+
+					`"raw_gplev":"0x%08x","ready_bit":%v,`+
+					`"since_iter_end_ms":%.2f,"since_spi_done_ms":%.2f,`+
+					`"loop_top_ms":%.2f,"prev_pace_req_ms":%.2f}`+"\n",
+				d.t, d.frame, d.gpioAtEntry,
+				d.rawGPLEV, (d.rawGPLEV>>16)&1 == 1,
+				d.sinceIterEnd, d.sinceSPIDone,
+				d.loopTop, d.prevPaceReq)
+		}
+		fmt.Printf("  debug: %d timeout diagnostics written to log\n", len(dbgDiags))
 	}
 
 	// Flush and close log

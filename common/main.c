@@ -195,10 +195,50 @@ int main(void) {
     uint64_t last_valid_frame_us = time_us_64();
     bool timed_out = false;
 
+    // deferred stats: captured on trigger, printed during idle to avoid
+    // USB CDC blocking the frame-processing path.
+    bool stats_pending = false;
+    uint32_t stats_uptime_s;
+    uint32_t stats_frame_count;
+    uint32_t stats_error_count;
+    uint32_t stats_drop_count;
+    uint32_t stats_fps_x10;
+    uint64_t stats_total_bytes;
+    uint32_t stats_dma_rem;
+    uint32_t stats_fifo_extra;
+    uint32_t stats_err_counts[7];
+
     while (true) {
         watchdog_update();
 
         if (!spi_slave_frame_ready()) {
+            // print deferred stats only when no frame is waiting,
+            // so USB CDC blocking can't stall frame processing.
+            // re-check frame_ready after each printf to bail out immediately
+            // if a frame arrives while USB CDC was blocking.
+            if (stats_pending && !spi_slave_frame_ready()) {
+                stats_pending = false;
+                printf("[%lus] frames:%lu err:%lu drop:%lu fps:%lu.%lu bytes:%llu "
+                       "dma_rem:%lu fifo_extra:%lu "
+                       "err[sync:%lu crc:%lu len:%lu port:%lu align:%lu short:%lu ver:%lu]\n",
+                       (unsigned long)stats_uptime_s,
+                       (unsigned long)stats_frame_count,
+                       (unsigned long)stats_error_count,
+                       (unsigned long)stats_drop_count,
+                       (unsigned long)(stats_fps_x10 / 10),
+                       (unsigned long)(stats_fps_x10 % 10),
+                       (unsigned long long)stats_total_bytes,
+                       (unsigned long)stats_dma_rem,
+                       (unsigned long)stats_fifo_extra,
+                       (unsigned long)stats_err_counts[FRAME_ERR_BAD_SYNC - 1],
+                       (unsigned long)stats_err_counts[FRAME_ERR_BAD_CRC - 1],
+                       (unsigned long)stats_err_counts[FRAME_ERR_BAD_LENGTH - 1],
+                       (unsigned long)stats_err_counts[FRAME_ERR_BAD_PORTS - 1],
+                       (unsigned long)stats_err_counts[FRAME_ERR_ALIGNMENT - 1],
+                       (unsigned long)stats_err_counts[FRAME_ERR_TOO_SHORT - 1],
+                       (unsigned long)stats_err_counts[FRAME_ERR_VERSION - 1]);
+            }
+
             // check software timeout in idle path
             if (!timed_out && (time_us_64() - last_valid_frame_us) > TIMEOUT_US) {
                 timed_out = true;
@@ -338,34 +378,26 @@ int main(void) {
         multicore_fifo_push_blocking((uint32_t)&dispatch);
         bp_write ^= 1;
 
-        // periodic stats (every 1000 frames, ~25s at 40fps)
-        if (frame_count % 1000 == 0) {
+        // periodic stats: snapshot values now, defer printf to idle path.
+        // skip frame 1000 — the first interval includes pre-streaming idle
+        // time (bad FPS), and the first USB CDC write can block for seconds
+        // if the host hasn't polled the endpoint recently.
+        if (frame_count % 1000 == 0 && frame_count > 1000) {
             uint64_t now_us = time_us_64();
             uint64_t elapsed_us = now_us - stats_interval_start_us;
-            uint32_t fps_x10 = (elapsed_us > 0)
+
+            stats_fps_x10 = (elapsed_us > 0)
                 ? (uint32_t)((uint64_t)interval_frames * 10000000 / elapsed_us)
                 : 0;
-            uint32_t uptime_s = (uint32_t)(now_us / 1000000);
-
-            printf("[%lus] frames:%lu err:%lu drop:%lu fps:%lu.%lu bytes:%llu "
-                   "dma_rem:%lu fifo_extra:%lu "
-                   "err[sync:%lu crc:%lu len:%lu port:%lu align:%lu short:%lu ver:%lu]\n",
-                   (unsigned long)uptime_s,
-                   (unsigned long)frame_count,
-                   (unsigned long)error_count,
-                   (unsigned long)drop_count,
-                   (unsigned long)(fps_x10 / 10),
-                   (unsigned long)(fps_x10 % 10),
-                   (unsigned long long)total_bytes,
-                   (unsigned long)spi_slave_debug_remaining(),
-                   (unsigned long)spi_slave_debug_fifo_extra(),
-                   (unsigned long)err_counts[FRAME_ERR_BAD_SYNC - 1],
-                   (unsigned long)err_counts[FRAME_ERR_BAD_CRC - 1],
-                   (unsigned long)err_counts[FRAME_ERR_BAD_LENGTH - 1],
-                   (unsigned long)err_counts[FRAME_ERR_BAD_PORTS - 1],
-                   (unsigned long)err_counts[FRAME_ERR_ALIGNMENT - 1],
-                   (unsigned long)err_counts[FRAME_ERR_TOO_SHORT - 1],
-                   (unsigned long)err_counts[FRAME_ERR_VERSION - 1]);
+            stats_uptime_s = (uint32_t)(now_us / 1000000);
+            stats_frame_count = frame_count;
+            stats_error_count = error_count;
+            stats_drop_count = drop_count;
+            stats_total_bytes = total_bytes;
+            stats_dma_rem = spi_slave_debug_remaining();
+            stats_fifo_extra = spi_slave_debug_fifo_extra();
+            memcpy(stats_err_counts, err_counts, sizeof(err_counts));
+            stats_pending = true;
 
             interval_frames = 0;
             stats_interval_start_us = now_us;
