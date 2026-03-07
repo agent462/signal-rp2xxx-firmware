@@ -7,7 +7,9 @@ Firmware for RP2040/RP2350 microcontrollers that receive LED frame data daemon o
 | Board | MCU | Channels | Level Shifter | Config |
 |-------|-----|----------|---------------|--------|
 | SCORPIO | Adafruit Feather RP2040 SCORPIO | 8 | Built-in | `boards/scorpio/` |
-| Pico 2 W 8-ch | Raspberry Pi Pico 2 W (RP2350) | 8 | External SN74AHCT245N | `boards/pico2w_8ch/` |
+| Pico 2 W 8-ch | Raspberry Pi Pico 2 W (RP2350) | 8 | 1× SN74AHCT245N | `boards/pico2w_8ch/` |
+| Pico 2 W 16-ch | Raspberry Pi Pico 2 W (RP2350) | 16 | 2× SN74AHCT245N | `boards/pico2w_16ch/` |
+| Pico 2 W 24-ch (Needs Stability Testing) | Raspberry Pi Pico 2 W (RP2350) | 24 | 3× SN74AHCT245N | `boards/pico2w_24ch/` |
 | Signal 8 | RP2350A on custom carrier (CM5) | 8 native + 4 differential + DMX | 74HCT245 + RS-485 | `boards/signal8/` |
 
 ## Directory Structure
@@ -28,8 +30,14 @@ boards/
   scorpio/                  Adafruit Feather RP2040 SCORPIO
     config.h                pin assignments, SPI1 on GPIO8/9/14/15
     CMakeLists.txt          PICO_BOARD defaults to pico
-  pico2w_8ch/               Pico 2 W + SN74AHCT245N (8 channels)
+  pico2w_8ch/               Pico 2 W + 1× SN74AHCT245N (8 channels)
     config.h                pin assignments, SPI0 on GPIO16-19
+    CMakeLists.txt          PICO_BOARD=pico2_w
+  pico2w_16ch/              Pico 2 W + 2× SN74AHCT245N (16 channels)
+    config.h                pin assignments, SPI0 on GPIO16-19
+    CMakeLists.txt          PICO_BOARD=pico2_w
+  pico2w_24ch/              Pico 2 W + 3× SN74AHCT245N (24 channels)
+    config.h                pin assignments, SPI1 on GPIO24-27
     CMakeLists.txt          PICO_BOARD=pico2_w
   signal8/                  Signal 8 controller (RP2350A + CM5 carrier)
     config.h                pin assignments, 8 native + 4 diff + DMX
@@ -76,6 +84,18 @@ cd boards/pico2w_8ch
 mkdir -p build && cd build
 cmake .. && make -j4
 # output: build/signal_pico2w.uf2
+
+# Pico 2 W (16-channel)
+cd boards/pico2w_16ch
+mkdir -p build && cd build
+cmake .. && make -j4
+# output: build/signal_pico2w_16ch.uf2
+
+# Pico 2 W (24-channel)
+cd boards/pico2w_24ch
+mkdir -p build && cd build
+cmake .. && make -j4
+# output: build/signal_pico2w_24ch.uf2
 
 # Signal 8 (8 native + 4 differential)
 cd boards/signal8
@@ -224,7 +244,7 @@ GPIO22 --> RS-485 DE (direction: DMX)
 
 ## SPI Protocol
 
-A daemon sends frames over SPI at up to 15 MHz (RP2040) / 20 MHz (RP2350). The firmware is a SPI slave using PL022 Mode 3 (CPOL=1, CPHA=1).
+A daemon sends frames over SPI at up to 15 MHz (RP2040) / 24 MHz (RP2350). The firmware is a SPI slave using PL022 Mode 3 (CPOL=1, CPHA=1).
 
 ### Frame Format
 
@@ -261,8 +281,8 @@ PL022 slave requires `clk_peri >= 12 × f_SCK`. With `PICO_CLOCK_ADJUST_PERI_CLO
 | Board | MCU | sys_clk | Max SPI SCK | Throughput |
 |-------|-----|---------|-------------|------------|
 | SCORPIO | RP2040 | 180 MHz | 15 MHz | 1.88 MB/s |
-| Pico 2 W 8-ch | RP2350 | 250 MHz | 20 MHz | 2.60 MB/s |
-| Signal 8 | RP2350 | 250 MHz | 20 MHz | 2.60 MB/s |
+| Pico 2 W 8/16/24-ch | RP2350 | 288 MHz | 24 MHz | 3.00 MB/s |
+| Signal 8 | RP2350 | 288 MHz | 24 MHz | 3.00 MB/s |
 
 #### Frame Timing
 
@@ -272,14 +292,18 @@ SPI reception (core 0) and WS281x output (core 1) are pipelined, so the bottlene
 |-------|---------------|------------|----------|-------------|------------|---------|
 | SCORPIO | 8 × 300 | 7,200 B | 3.8 ms @ 15 MHz | 9 ms | WS281x | **111** |
 | SCORPIO | 8 × 800 | 19,200 B | 10.2 ms @ 15 MHz | 24 ms | WS281x | **41** |
-| Pico 2 W | 8 × 300 | 7,200 B | 2.9 ms @ 20 MHz | 9 ms | WS281x | **111** |
-| Pico 2 W | 8 × 800 | 19,200 B | 7.7 ms @ 20 MHz | 24 ms | WS281x | **41** |
-| Signal 8 | 12 × 300 | 10,800 B | 4.3 ms @ 20 MHz | 9 ms | WS281x | **111** |
-| Signal 8 | 12 × 800 | 28,800 B | 11.5 ms @ 20 MHz | 24 ms | WS281x | **41** |
+| Pico 2 W 8-ch | 8 × 300 | 7,200 B | 2.4 ms @ 24 MHz | 9 ms | WS281x | **111** |
+| Pico 2 W 8-ch | 8 × 800 | 19,200 B | 6.4 ms @ 24 MHz | 24 ms | WS281x | **41** |
+| Pico 2 W 16-ch | 16 × 300 | 14,400 B | 4.8 ms @ 24 MHz | 9 ms | WS281x | **111** |
+| Pico 2 W 16-ch | 16 × 800 | 38,400 B | 12.8 ms @ 24 MHz | 24 ms | WS281x | **41** |
+| Pico 2 W 24-ch | 24 × 300 | 21,600 B | 7.2 ms @ 24 MHz | 9 ms | WS281x | **111** |
+| Pico 2 W 24-ch | 24 × 800 | 57,600 B | 19.2 ms @ 24 MHz | 24 ms | WS281x | **41** |
+| Signal 8 | 12 × 300 | 10,800 B | 3.6 ms @ 24 MHz | 9 ms | WS281x | **111** |
+| Signal 8 | 12 × 800 | 28,800 B | 9.6 ms @ 24 MHz | 24 ms | WS281x | **41** |
 
-All target configurations (8 × 800 @ 40 fps on RP2040, 12 × 800 @ 40 fps on RP2350) are comfortably within limits — SPI transfer completes well before WS281x output finishes.
+All target configurations are comfortably within limits — SPI transfer completes well before WS281x output finishes, even at 24 × 800 pixels.
 
-The firmware has been pushed to near mathmateical theoretical limits of WS2811 for 800 Pixels (41.6 FPS) on 8 ports for long runs. The little loss will be from interupt handling, processing and wire speed.  
+The firmware has been pushed to near theoretical limits of WS2811 for 800 Pixels (41.6 FPS) on 8 ports for long runs. The little loss will be from interupt handling, processing and wire speed.  
 
 | Metric | Value |
 |--------|-------|
@@ -293,7 +317,7 @@ The firmware has been pushed to near mathmateical theoretical limits of WS2811 f
 
 ### SPI Slave Notes
 
-- PL022 slave max SCK = clk_peri / 12 (15 MHz @ 180 MHz, 20.83 MHz @ 250 MHz)
+- PL022 slave max SCK = clk_peri / 12 (15 MHz @ 180 MHz, 24 MHz @ 288 MHz)
 - Mode 3 (CPHA=1) required for multi-byte transfers with CS held low
 - First frame after boot is bit-shifted; daemon sends a 4-byte dummy to align
 - SCK needs pull-up (CPOL=1 idles HIGH)
@@ -325,7 +349,7 @@ Required defines in `config.h`:
 | Define | Purpose |
 |--------|---------|
 | `BOARD_NAME` | String for boot message |
-| `SYS_CLOCK_KHZ` | System clock (180000 RP2040, 250000 RP2350) |
+| `SYS_CLOCK_KHZ` | System clock (180000 RP2040, 288000 RP2350) |
 | `NEO_PIN_BASE` | First GPIO for PIO LED outputs |
 | `NUM_PORTS` | Number of parallel LED outputs |
 | `MAX_PIXELS` | Max pixels per port |
